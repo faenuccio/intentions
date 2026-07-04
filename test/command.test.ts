@@ -7,6 +7,24 @@ test('claim: bare and with whitespace/case', () => {
   assert.deepEqual(parseCommand('  CLAIM\n'), { kind: 'claim', expiryArg: '', note: '' })
 })
 
+test('register / intention are synonyms of claim', () => {
+  // bare, with expiry, and with a note — all behave exactly like `claim`.
+  assert.deepEqual(parseCommand('register'), { kind: 'claim', expiryArg: '', note: '' })
+  assert.deepEqual(parseCommand('INTENTION'), { kind: 'claim', expiryArg: '', note: '' })
+  assert.deepEqual(parseCommand('intention 2026-09-01'),
+    { kind: 'claim', expiryArg: '2026-09-01', note: '' })
+  assert.deepEqual(parseCommand('register 3 weeks'),
+    { kind: 'claim', expiryArg: '3 weeks', note: '' })
+  assert.deepEqual(parseCommand('intention\nWorking on the parser.'),
+    { kind: 'claim', expiryArg: '', note: 'Working on the parser.' })
+})
+
+test('synonyms are anchored: longer words do not trigger', () => {
+  assert.equal(parseCommand('registered'), null)
+  assert.equal(parseCommand('intentional'), null)
+  assert.equal(parseCommand('I intend to register this later'), null)
+})
+
 test('claim: with expiry argument', () => {
   assert.deepEqual(parseCommand('claim 1h'), { kind: 'claim', expiryArg: '1h', note: '' })
   assert.deepEqual(parseCommand('claim 3 weeks'), { kind: 'claim', expiryArg: '3 weeks', note: '' })

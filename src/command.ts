@@ -34,12 +34,14 @@ export function parseCommand(body: string): Command | null {
 
   // claim: match on the first line only; following lines (if any) become the note. Leading blank
   // lines are tolerated (trimStart) so an accidental newline before `claim` still parses.
+  // `register` and `intention` are accepted as synonyms of `claim` (the registry-facing spellings),
+  // so a registrant can renew with `intention 2026-09-01` exactly as with `claim`.
   const fromCommand = body.trimStart()
   const newlineIdx = fromCommand.search(/\r?\n/)
   const firstLine = newlineIdx === -1 ? fromCommand : fromCommand.slice(0, newlineIdx)
   const note = newlineIdx === -1 ? '' : fromCommand.slice(newlineIdx).trim()
   const firstNormalized = firstLine.replace(/\s+/g, ' ').trim().toLowerCase()
-  const claim = firstNormalized.match(/^claim(?:\s+(.*))?$/)
+  const claim = firstNormalized.match(/^(?:claim|register|intention)(?:\s+(.*))?$/)
   if (claim) return { kind: 'claim', expiryArg: claim[1] ?? '', note }
 
   // assign @login [expiry]: like claim, but registers someone else. The `@` is required so prose
