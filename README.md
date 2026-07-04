@@ -17,10 +17,10 @@ Comment on an issue that's on the project board:
 
 | Comment | Effect |
 |---|---|
-| `claim` | Claim the task with the project's default TTL. |
-| `claim 2w` · `claim 5 hours` · `claim 2026-08-01` | Claim with a custom expiry (duration or date). |
-| `claim …` (again, as the holder) | Renew / extend your claim. |
-| `claim` + following lines | Attach a freeform note (see below). |
+| `intention` | Register the task with the project's default TTL. |
+| `intention 2w` · `intention 5 hours` · `intention 2026-08-01` | Register with a custom expiry (duration or date). |
+| `intention …` (again, as the holder) | Renew / extend your registration. |
+| `intention` + following lines | Attach a freeform note (see below). |
 | `assign @bob` · `assign @bob 2w` | Register **someone else** on the task (see below). |
 | `disclaim` | Release a task you hold. |
 | `propose PR #123` | Link your PR; move the task to *In Progress* (refreshes the TTL). |
