@@ -58,8 +58,14 @@ test('parses comma-separated handles with @', () => {
   assert.deepEqual(parseParticipants('@alice, @bob'), ['alice', 'bob'])
 })
 
-test('parses handles without @, mixed separators and newlines', () => {
-  assert.deepEqual(parseParticipants('alice; @bob\ncarol-dee'), ['alice', 'bob', 'carol-dee'])
+test('parses mixed separators and newlines', () => {
+  assert.deepEqual(parseParticipants('@alice; @bob\n@carol-dee'), ['alice', 'bob', 'carol-dee'])
+})
+
+test('ignores bare words, so free-text names never become handles', () => {
+  assert.deepEqual(parseParticipants('Alice Smith and Bob Jones'), [])
+  assert.deepEqual(parseParticipants('me and my student'), [])
+  assert.deepEqual(parseParticipants('Alice Smith, @bob'), ['bob'])
 })
 
 test('drops tokens that are not well-formed logins', () => {
