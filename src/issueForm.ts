@@ -18,3 +18,28 @@ export function readFormField(body: string, label: string): string | null {
   if (value === '' || value === '_No response_') return null
   return value
 }
+
+/**
+ * Parse a list of GitHub handles out of a form-field value like `@alice, @bob charlie`.
+ *
+ * Handles may be separated by commas, semicolons, or any whitespace, each with or without a
+ * leading `@`. Tokens that aren't a well-formed GitHub login (1–39 alphanumerics/hyphens, no
+ * leading/trailing/double hyphen) are dropped rather than reported: the field is free text, so
+ * stray words must not turn into assignment attempts. Duplicates collapse case-insensitively to
+ * the first spelling. A null/blank value yields [].
+ */
+export function parseParticipants(value: string | null): string[] {
+  if (!value) return []
+  const logins: string[] = []
+  const seen = new Set<string>()
+  for (const token of value.split(/[\s,;]+/)) {
+    const m = token.match(/^@?([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/)
+    if (!m) continue
+    const login = m[1]!
+    const key = login.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    logins.push(login)
+  }
+  return logins
+}

@@ -27,6 +27,7 @@ export interface Config {
   claimOnOpen: boolean
   claimExpiryField: string
   claimExpiryRequireDate: boolean
+  claimParticipantsField: string
 }
 
 /** True when the project has turned expiry off entirely (default-ttl: none). */
@@ -116,6 +117,7 @@ export function readConfig(): Config {
     claimOnOpen: boolInput('claim-on-open', false),
     claimExpiryField: core.getInput('claim-expiry-field') || '',
     claimExpiryRequireDate: boolInput('claim-expiry-require-date', false),
+    claimParticipantsField: core.getInput('claim-participants-field') || '',
   }
 }
 
