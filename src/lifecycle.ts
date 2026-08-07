@@ -209,9 +209,16 @@ async function registerParticipants(
   body: string,
 ): Promise<{ added: string[]; missing: string[] }> {
   if (!cfg.claimParticipantsField) return { added: [], missing: [] }
-  const listed = parseParticipants(readFormField(body, cfg.claimParticipantsField))
+  // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
+  // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
+  // is still named in the confirmation comment rather than dropped silently.
+  const maxParticipants = 9
+  const all = parseParticipants(readFormField(body, cfg.claimParticipantsField))
     .filter((p) => p.toLowerCase() !== author.toLowerCase())
-  if (listed.length === 0) return { added: [], missing: [] }
+  if (all.length === 0) return { added: [], missing: [] }
+  const listed = all.slice(0, maxParticipants)
+  const overflow = all.slice(maxParticipants)
+  if (overflow.length) core.info(`#${num}: ${all.length} participants listed; probing the first ${maxParticipants}.`)
 
   try {
     const assignable: string[] = []
@@ -224,10 +231,10 @@ async function registerParticipants(
     const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()))
     const added = assignable.filter((p) => after.has(p.toLowerCase()))
     const dropped = assignable.filter((p) => !after.has(p.toLowerCase()))
-    return { added, missing: [...rejected, ...dropped] }
+    return { added, missing: [...rejected, ...dropped, ...overflow] }
   } catch (err) {
     core.warning(`#${num}: could not register participants (${(err as Error).message}); continuing with the author alone.`)
-    return { added: [], missing: listed }
+    return { added: [], missing: all }
   }
 }
 
