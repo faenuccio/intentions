@@ -1,0 +1,52 @@
+name: Release
+
+# Cuts a release from the Actions tab: creates the immutable version tag (v1.X.Y) at the tip of
+# main and force-moves the floating `v1` tag to it — the ref every adopter's caller workflow pins,
+# so moving it is what actually ships merged code. A tag move can't be expressed as a pull
+# request; this workflow gives that step a reviewable, one-click home instead of ad-hoc pushes.
+#
+# To release: merge the feature PR(s), then Actions → Release → "Run workflow" with the next
+# version number. Nothing ships until this runs.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to create at main HEAD, which v1 then moves to (e.g. v1.6.0).'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # One release at a time; a typo'd rerun must not race a good one.
+    concurrency:
+      group: intentions-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^v1\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::version must look like v1.X.Y (got '$VERSION')"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::tag $VERSION already exists — version tags are immutable"; exit 1
+          fi
+      - name: Tag ${{ inputs.version }} and move v1
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$VERSION"
+          git tag -f v1
+          git push origin "refs/tags/$VERSION"
+          git push -f origin refs/tags/v1
+          echo "Released $VERSION; v1 now points to $(git rev-parse --short HEAD)." >> "$GITHUB_STEP_SUMMARY"
