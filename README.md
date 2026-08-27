@@ -53,7 +53,7 @@ or step back with `disclaim`. The bot's confirmation is addressed to the assigne
 ### Group registrations (participants)
 
 A task can be held by several people at once. Point `claim-participants-field` at an issue-form
-field in which the author lists their co-workers' GitHub handles (with or without `@`, separated
+field in which the author lists their co-workers' GitHub handles (with a leading `@`, separated
 by commas or whitespace), and the bot registers everyone alongside the author when the issue
 opens (with `claim-on-open`). GitHub only accepts collaborators, org members, and prior
 commenters as assignees; anyone the bot couldn't add is named in the confirmation comment and can
