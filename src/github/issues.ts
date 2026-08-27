@@ -7,6 +7,11 @@ export async function getAssignees(octokit: Octokit, owner: string, repo: string
   return (res.data.assignees ?? []).map((a) => a.login)
 }
 
+export async function getIssueBody(octokit: Octokit, owner: string, repo: string, issue_number: number): Promise<string> {
+  const res = await octokit.rest.issues.get({ owner, repo, issue_number })
+  return res.data.body ?? ''
+}
+
 /**
  * The issues a PR closes via GitHub's parsed linkage (`Closes #N` / `Fixes #N` and the
  * "Development" sidebar), restricted to issues in this same repo (the board's tasks).
@@ -83,6 +88,13 @@ export async function canBeAssigned(octokit: Octokit, owner: string, repo: strin
 
 export async function assign(octokit: Octokit, owner: string, repo: string, issue_number: number, login: string): Promise<void> {
   await octokit.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [login] })
+}
+
+/** Add several assignees in one call. GitHub silently drops users it won't accept (and enforces
+ * its 10-assignee cap), so callers that care must re-read the assignees and compare. */
+export async function assignMany(octokit: Octokit, owner: string, repo: string, issue_number: number, logins: string[]): Promise<void> {
+  if (logins.length === 0) return
+  await octokit.rest.issues.addAssignees({ owner, repo, issue_number, assignees: logins })
 }
 
 export async function unassign(octokit: Octokit, owner: string, repo: string, issue_number: number, login: string): Promise<void> {

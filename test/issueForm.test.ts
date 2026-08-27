@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFormField } from '../src/issueForm.js'
+import { readFormField, parseParticipants } from '../src/issueForm.js'
 
 const body = [
   '### What are you working on?',
@@ -50,4 +50,39 @@ test('empty body or label yields null', () => {
 test('collapses to null when the section is blank', () => {
   const b = '### Field\n\n\n### Next\n\nv'
   assert.equal(readFormField(b, 'Field'), null)
+})
+
+// ---- parseParticipants -------------------------------------------------------------------
+
+test('parses comma-separated handles with @', () => {
+  assert.deepEqual(parseParticipants('@alice, @bob'), ['alice', 'bob'])
+})
+
+test('parses mixed separators and newlines', () => {
+  assert.deepEqual(parseParticipants('@alice; @bob\n@carol-dee'), ['alice', 'bob', 'carol-dee'])
+})
+
+test('ignores bare words, so free-text names never become handles', () => {
+  assert.deepEqual(parseParticipants('Alice Smith and Bob Jones'), [])
+  assert.deepEqual(parseParticipants('me and my student'), [])
+  assert.deepEqual(parseParticipants('Alice Smith, @bob'), ['bob'])
+})
+
+test('drops tokens that are not well-formed logins', () => {
+  assert.deepEqual(parseParticipants('@alice, handle!, -bad, bad-, dou--ble, @b_ob, https://github.com/carol'), ['alice'])
+})
+
+test('dedupes case-insensitively, keeping the first spelling', () => {
+  assert.deepEqual(parseParticipants('@Alice @alice @ALICE @bob'), ['Alice', 'bob'])
+})
+
+test('null or blank value yields []', () => {
+  assert.deepEqual(parseParticipants(null), [])
+  assert.deepEqual(parseParticipants('   '), [])
+})
+
+test('caps login length at 39 characters', () => {
+  const long = 'a'.repeat(40)
+  const ok = 'a'.repeat(39)
+  assert.deepEqual(parseParticipants(`@${long} @${ok}`), [ok])
 })

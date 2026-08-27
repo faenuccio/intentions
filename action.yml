@@ -60,6 +60,10 @@ inputs:
     description: 'Require the claim-expiry-field value to be an absolute date (e.g. "2026-09-01"); a duration like "6 months" is refused and falls back to default-ttl. Keeps the recorded expiry a date a reader can see without knowing the claim date. Only used when claim-on-open is true.'
     required: false
     default: 'false'
+  claim-participants-field:
+    description: 'Issue-form field label listing co-participants'' GitHub handles (e.g. "Participants"). On open (with claim-on-open), everyone listed that GitHub accepts as an assignee is registered alongside the author; afterwards, anyone listed there may comment `claim` to join the active registration as a co-holder. Empty disables both.'
+    required: false
+    default: ''
   terminal-statuses:
     description: 'Comma-separated status names the bot recognizes but does not manage (claims here are refused cleanly).'
     required: false

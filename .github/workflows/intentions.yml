@@ -60,6 +60,10 @@ on:
         required: false
         type: boolean
         default: false
+      claim-participants-field:
+        required: false
+        type: string
+        default: ''
       expiry-field:
         required: false
         type: string
@@ -130,6 +134,7 @@ jobs:
           status-claimed: ${{ inputs.status-claimed }}
           status-in-progress: ${{ inputs.status-in-progress }}
           terminal-statuses: ${{ inputs.terminal-statuses }}
+          claim-participants-field: ${{ inputs.claim-participants-field }}
           expiry-field: ${{ inputs.expiry-field }}
           default-ttl: ${{ inputs.default-ttl }}
           max-ttl: ${{ inputs.max-ttl }}
@@ -172,6 +177,7 @@ jobs:
           claim-on-open: ${{ inputs.claim-on-open }}
           claim-expiry-field: ${{ inputs.claim-expiry-field }}
           claim-expiry-require-date: ${{ inputs.claim-expiry-require-date }}
+          claim-participants-field: ${{ inputs.claim-participants-field }}
           expiry-field: ${{ inputs.expiry-field }}
           default-ttl: ${{ inputs.default-ttl }}
           max-ttl: ${{ inputs.max-ttl }}

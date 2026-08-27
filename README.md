@@ -50,6 +50,22 @@ or step back with `disclaim`. The bot's confirmation is addressed to the assigne
 
 > @bob, @alice has registered you as working on this task. This registration expires **Aug 1, 2026**.
 
+### Group registrations (participants)
+
+A task can be held by several people at once. Point `claim-participants-field` at an issue-form
+field in which the author lists their co-workers' GitHub handles (with a leading `@`, separated
+by commas or whitespace), and the bot registers everyone alongside the author when the issue
+opens (with `claim-on-open`). GitHub only accepts collaborators, org members, and prior
+commenters as assignees; anyone the bot couldn't add is named in the confirmation comment and can
+simply comment `claim` on the issue — being listed in the form is the author's standing
+invitation, so instead of the usual "task not available" refusal they **join** the registration
+as a co-holder (and commenting is precisely what makes them assignable).
+
+Co-holders are full holders: any of them can renew with `claim <when>`, link PRs, or step back
+with `disclaim`. A disclaim on a co-held task removes only the commenter — the task stays
+registered to the others, with its expiry and note intact — and only the last holder leaving (or
+the sweep expiring the whole registration) releases it back to *Unclaimed*.
+
 ### Claim notes
 
 The first line of a `claim` comment is the command (and optional expiry); everything on the
@@ -74,7 +90,7 @@ so you don't have to wire up GitHub's native Project automations:
 
 | Event | Effect |
 |---|---|
-| Issue opened | Added to the board as *Unclaimed* (`auto-add`, on by default). With `claim-on-open`, auto-claimed for the issue author, reading the expiry from the issue form — so registering needs only the form, no `claim` comment. |
+| Issue opened | Added to the board as *Unclaimed* (`auto-add`, on by default). With `claim-on-open`, auto-claimed for the issue author, reading the expiry from the issue form — so registering needs only the form, no `claim` comment. With `claim-participants-field`, co-participants listed in the form are registered alongside the author. |
 | Issue labeled | Added as *Unclaimed* if the new label satisfies `auto-add-labels` and it is not on the board yet, so a label applied after the issue opened still lands it. Ignored for a closed issue. |
 | PR opened linking the issue (`Closes #123`) | Claims it for the PR author if unclaimed, then moves to *In Review* (or *In Progress* while the PR is a draft) and refreshes the TTL. |
 | PR merged | Task → *Completed*. |
@@ -245,6 +261,7 @@ All inputs (set on the reusable workflow):
 | `claim-on-open` | `false` | auto-claim a newly opened (auto-added) issue for its author, so registering needs only the issue form and no separate `claim` comment |
 | `claim-expiry-field` | `` | issue-form field label to read the auto-claim expiry from (e.g. `Credible expiry date`); empty/missing/unparseable falls back to `default-ttl`. Only used when `claim-on-open` is set |
 | `claim-expiry-require-date` | `false` | require `claim-expiry-field` to be an absolute date (e.g. `2026-09-01`); a duration like `6 months` is refused and falls back to `default-ttl`, so the recorded expiry is a date readers see without doing the math. Only used when `claim-on-open` is set |
+| `claim-participants-field` | `` | issue-form field label listing co-participants' GitHub handles (e.g. `Participants`). On open (with `claim-on-open`), everyone listed that GitHub accepts is registered alongside the author; anyone listed may later comment `claim` to join the registration as a co-holder. See [Group registrations](#group-registrations-participants) |
 | `terminal-statuses` | `In Review,Completed` | states where a `claim` comment is refused |
 | `expiry-field` | `Claim Expires` | Text field holding the ISO 8601 UTC expiry |
 | `note-field` | `Claim Note` | optional Text field holding the freeform claim note; ignored if absent |

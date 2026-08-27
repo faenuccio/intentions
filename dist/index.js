@@ -31933,6 +31933,7 @@ function readConfig() {
         claimOnOpen: boolInput('claim-on-open', false),
         claimExpiryField: core.getInput('claim-expiry-field') || '',
         claimExpiryRequireDate: boolInput('claim-expiry-require-date', false),
+        claimParticipantsField: core.getInput('claim-participants-field') || '',
     };
 }
 /** Boolean input with a default when unset (core.getBooleanInput throws on empty). */
@@ -32235,6 +32236,10 @@ async function getAssignees(octokit, owner, repo, issue_number) {
     const res = await octokit.rest.issues.get({ owner, repo, issue_number });
     return (res.data.assignees ?? []).map((a) => a.login);
 }
+async function getIssueBody(octokit, owner, repo, issue_number) {
+    const res = await octokit.rest.issues.get({ owner, repo, issue_number });
+    return res.data.body ?? '';
+}
 /**
  * The issues a PR closes via GitHub's parsed linkage (`Closes #N` / `Fixes #N` and the
  * "Development" sidebar), restricted to issues in this same repo (the board's tasks).
@@ -32299,6 +32304,13 @@ async function canBeAssigned(octokit, owner, repo, assignee) {
 }
 async function issues_assign(octokit, owner, repo, issue_number, login) {
     await octokit.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [login] });
+}
+/** Add several assignees in one call. GitHub silently drops users it won't accept (and enforces
+ * its 10-assignee cap), so callers that care must re-read the assignees and compare. */
+async function assignMany(octokit, owner, repo, issue_number, logins) {
+    if (logins.length === 0)
+        return;
+    await octokit.rest.issues.addAssignees({ owner, repo, issue_number, assignees: logins });
 }
 async function unassign(octokit, owner, repo, issue_number, login) {
     await octokit.rest.issues.removeAssignees({ owner, repo, issue_number, assignees: [login] });
@@ -32393,7 +32405,62 @@ async function writeNote(deps, itemId, note, clearIfEmpty = false) {
     await setNote(octokit, ctx, itemId, text);
 }
 
+;// CONCATENATED MODULE: ./src/issueForm.ts
+/**
+ * Read a single field out of a GitHub issue-form body.
+ *
+ * GitHub renders an issue form as Markdown: each field becomes a `### <label>` heading followed by
+ * the user's answer, up to the next `### ` heading (or the end of the body). An empty optional field
+ * renders as the literal `_No response_`. This lets the lifecycle pull, say, the expiry a registrant
+ * typed into the form so they don't have to repeat it in a separate `claim` comment.
+ */
+function readFormField(body, label) {
+    if (!body || !label)
+        return null;
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match the heading line exactly (only trailing spaces/tabs, not following blank lines), then
+    // capture up to the next `### ` heading or the end of the body.
+    const re = new RegExp(`(?:^|\\n)###[ \\t]+${escaped}[ \\t]*\\r?\\n([\\s\\S]*?)(?=\\r?\\n###[ \\t]|$)`);
+    const m = body.match(re);
+    if (!m)
+        return null;
+    const value = m[1].trim();
+    if (value === '' || value === '_No response_')
+        return null;
+    return value;
+}
+/**
+ * Parse a list of GitHub handles out of a form-field value like `@alice, @bob`.
+ *
+ * A handle must carry its `@`; handles may be separated by commas, semicolons, or any whitespace.
+ * The field is free text on a public form, so a bare word is never read as a handle: someone who
+ * types "Alice Smith and Bob Jones" means four names, and reading those as `@Alice`, `@Smith`,
+ * `@and`, `@Bob`, `@Jones` would notify (and possibly assign) unrelated accounts. Tokens that
+ * aren't a well-formed GitHub login (1–39 alphanumerics/hyphens, no leading/trailing/double
+ * hyphen) are dropped rather than reported. Duplicates collapse case-insensitively to the first
+ * spelling. A null/blank value yields [].
+ */
+function parseParticipants(value) {
+    if (!value)
+        return [];
+    const logins = [];
+    const seen = new Set();
+    for (const token of value.split(/[\s,;]+/)) {
+        const m = token.match(/^@([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/);
+        if (!m)
+            continue;
+        const login = m[1];
+        const key = login.toLowerCase();
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        logins.push(login);
+    }
+    return logins;
+}
+
 ;// CONCATENATED MODULE: ./src/commands/claim.ts
+
 
 
 
@@ -32405,8 +32472,9 @@ async function writeNote(deps, itemId, note, clearIfEmpty = false) {
  *
  * Resolution order (Codex hardening): load item + assignees + status FIRST, then branch.
  * If the actor already holds the claim, treat this as a renew/extend; otherwise require an
- * Unclaimed item with no assignees. Writes are ordered to fail closed: status + expiry are
- * set before assignment, so the sweep never sees a Claimed item with a missing expiry.
+ * Unclaimed item with no assignees — except that a co-participant listed in the issue form may
+ * join a held task (see tryJoinAsParticipant). Writes are ordered to fail closed: status +
+ * expiry are set before assignment, so the sweep never sees a Claimed item with a missing expiry.
  */
 async function handleClaim(deps, expiryArg, note) {
     const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
@@ -32450,6 +32518,10 @@ async function handleClaim(deps, expiryArg, note) {
         return;
     }
     if (item.statusOptionId !== unclaimedId || assignees.length > 0) {
+        // A held task refuses new claimants — unless the actor is on the registration's invitation
+        // list, in which case `claim` means "join" rather than "take over".
+        if (await tryJoinAsParticipant(deps, item, assignees, expiryArg, note))
+            return;
         const who = assignees.length ? assignees.map((a) => `@${a}`).join(', ') : 'someone';
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this task isn't available — it's currently **${statusName ?? 'not Unclaimed'}** (held by ${who}). It will free up if the claim is disclaimed or expires.`);
         return;
@@ -32480,6 +32552,59 @@ async function handleClaim(deps, expiryArg, note) {
         lines.push(`That's the project default. To set your own, comment e.g. \`claim 2w\`, \`claim 5 hours\`, or \`claim 2026-08-01\` — and \`claim <when>\` again any time to extend.`);
     }
     await comment(repoOctokit, owner, repo, issueNumber, lines.join('\n\n'));
+}
+/**
+ * Join an active registration as a listed co-participant.
+ *
+ * The issue form's participants field (`claim-participants-field`) is the author's explicit
+ * invitation list, so someone named there who comments `claim` on a held task joins it as a
+ * co-holder instead of being refused. This is also the self-service path for participants the
+ * auto-claim couldn't assign: by commenting they've just made themselves assignable, so the
+ * assignment that failed on open succeeds now. Joining leaves status and note untouched; a
+ * joiner who gave an expiry renews the shared one, exactly as any holder could a moment later.
+ *
+ * Returns true when the comment was handled here (joined, or failed with its own diagnostic);
+ * false hands back to the ordinary refusal.
+ */
+async function tryJoinAsParticipant(deps, item, assignees, expiryArg, note) {
+    const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
+    if (!cfg.claimParticipantsField)
+        return false;
+    const claimedId = requireOption(ctx, cfg.statusClaimed);
+    const inProgressId = optionId(ctx, cfg.statusInProgress);
+    const active = item.statusOptionId === claimedId || (inProgressId !== null && item.statusOptionId === inProgressId);
+    if (!active || assignees.length === 0)
+        return false;
+    if (assignees.some((a) => a.toLowerCase() === actor.toLowerCase()))
+        return false;
+    const body = await getIssueBody(repoOctokit, owner, repo, issueNumber);
+    const listed = parseParticipants(readFormField(body, cfg.claimParticipantsField));
+    if (!listed.some((p) => p.toLowerCase() === actor.toLowerCase()))
+        return false;
+    // Confirm the assignment stuck (GitHub silently drops assignees it won't accept). The actor
+    // just commented, so they're normally assignable; the cap of ten is the realistic failure.
+    await issues_assign(repoOctokit, owner, repo, issueNumber, actor);
+    const after = await getAssignees(repoOctokit, owner, repo, issueNumber);
+    if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} you're listed as a participant here, but GitHub didn't accept the assignment, so I couldn't register you on this task.`);
+        return true;
+    }
+    const holders = assignees.map((a) => `@${a}`).join(', ');
+    let line = `@${actor} you've joined this registration alongside ${holders}.`;
+    if (expiryEnabled(cfg) && expiryArg.trim()) {
+        const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs);
+        if (res.ok) {
+            await setExpiry(octokit, ctx, item.itemId, toStorage(res.expiry));
+            line += ` The registration now expires **${formatExpiry(res.expiry)}**.`;
+        }
+        else {
+            // Forgiving like auto-claim: the join stands, only the expiry change is declined.
+            line += ` I've left the shared expiry unchanged, though — ${res.reason}`;
+        }
+    }
+    await writeNote(deps, item.itemId, note);
+    await comment(repoOctokit, owner, repo, issueNumber, line);
+    return true;
 }
 
 ;// CONCATENATED MODULE: ./src/commands/assign.ts
@@ -32597,7 +32722,13 @@ async function handleAssign(deps, target, expiryArg, note) {
 
 
 
-/** Handle `disclaim`: release a claim you hold. Removes only the actor (claimant-only). */
+/**
+ * Handle `disclaim`: release a claim you hold. Removes only the actor (claimant-only).
+ *
+ * On a co-held registration (several assignees), a disclaim is one participant stepping back:
+ * the task stays registered to the others with its expiry and note intact. Only the last holder
+ * leaving releases the task back to Unclaimed and clears the board fields.
+ */
 async function handleDisclaim(deps) {
     const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
     const item = await getIssueItem(octokit, owner, repo, issueNumber, ctx);
@@ -32606,6 +32737,12 @@ async function handleDisclaim(deps) {
     const assignees = await getAssignees(repoOctokit, owner, repo, issueNumber);
     if (!assignees.includes(actor)) {
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} you're not the current claimant of this task, so there's nothing to disclaim.`);
+        return;
+    }
+    const remaining = assignees.filter((a) => a !== actor);
+    if (remaining.length > 0) {
+        await unassign(repoOctokit, owner, repo, issueNumber, actor);
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} you've stepped back from this task — it stays registered to ${remaining.map((a) => `@${a}`).join(', ')}.`);
         return;
     }
     const unclaimedId = requireOption(ctx, cfg.statusUnclaimed);
@@ -32832,31 +32969,6 @@ async function processCandidate(octokit, repoOctokit, cfg, ctx, c, now, onExpire
     core.info(`#${c.issueNumber}: expired and released.`);
 }
 
-;// CONCATENATED MODULE: ./src/issueForm.ts
-/**
- * Read a single field out of a GitHub issue-form body.
- *
- * GitHub renders an issue form as Markdown: each field becomes a `### <label>` heading followed by
- * the user's answer, up to the next `### ` heading (or the end of the body). An empty optional field
- * renders as the literal `_No response_`. This lets the lifecycle pull, say, the expiry a registrant
- * typed into the form so they don't have to repeat it in a separate `claim` comment.
- */
-function readFormField(body, label) {
-    if (!body || !label)
-        return null;
-    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Match the heading line exactly (only trailing spaces/tabs, not following blank lines), then
-    // capture up to the next `### ` heading or the end of the body.
-    const re = new RegExp(`(?:^|\\n)###[ \\t]+${escaped}[ \\t]*\\r?\\n([\\s\\S]*?)(?=\\r?\\n###[ \\t]|$)`);
-    const m = body.match(re);
-    if (!m)
-        return null;
-    const value = m[1].trim();
-    if (value === '' || value === '_No response_')
-        return null;
-    return value;
-}
-
 ;// CONCATENATED MODULE: ./src/lifecycle.ts
 
 
@@ -32981,6 +33093,7 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
         core.info(`#${num}: GitHub didn't accept @${author} as an assignee; left ${cfg.statusUnclaimed} for a manual claim.`);
         return;
     }
+    const { added, missing } = await registerParticipants(repoOctokit, cfg, owner, repo, num, author, body);
     let expiry = null;
     let expiryNote = '';
     if (expiryEnabled(cfg)) {
@@ -33005,18 +33118,69 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
         }
     }
     await setStatus(octokit, ctx, itemId, claimed);
-    let first = `@${author} you're now registered as working on this — no extra step needed.`;
+    let first = added.length
+        ? `@${author} you're now registered as working on this together with ${added.map((a) => `@${a}`).join(', ')} — no extra step needed.`
+        : `@${author} you're now registered as working on this — no extra step needed.`;
     if (expiry)
         first += ` This registration expires **${formatExpiry(expiry)}**.`;
     if (expiryNote)
         first += expiryNote;
+    if (missing.length) {
+        first += ` I couldn't register ${missing.map((m) => `@${m}`).join(', ')} — GitHub only lets me assign collaborators, org members, or people who have commented on the issue. Anyone listed can comment \`claim\` here to add themselves.`;
+    }
     // When the form requires an absolute date, don't advertise a duration example the form would reject.
     const changeHint = cfg.claimExpiryRequireDate ? 'e.g. `claim 2026-09-01`' : 'e.g. `claim 2 weeks` or `claim 2026-09-01`';
     const second = expiryEnabled(cfg)
         ? `Comment \`claim <when>\` to change the expiry (${changeHint}), \`claim\` again to renew, or \`disclaim\` to release it.`
         : 'Comment `disclaim` to release it once you\'re done.';
     await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}`);
-    core.info(`#${num}: auto-claimed for @${author}.`);
+    core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}.`);
+}
+/**
+ * Register the co-participants a registrant listed in the issue form (`claim-participants-field`)
+ * alongside the author, so a group project shows every member on the board's Assignees column.
+ *
+ * Best effort by design: GitHub only accepts collaborators, org members, and prior commenters as
+ * assignees, and caps an issue at ten. Each handle is probed with `canBeAssigned` first (precise
+ * feedback), then the survivors are added in one call and re-read, since assignability can still
+ * change in the window and GitHub drops rejects silently. Whoever didn't stick is reported back
+ * for the confirmation comment, which points them at the `claim`-to-join path (commenting makes
+ * them assignable, so that path unblocks itself). A failure here never blocks the author's claim.
+ */
+async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, body) {
+    if (!cfg.claimParticipantsField)
+        return { added: [], missing: [] };
+    // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
+    // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
+    // is still named in the confirmation comment rather than dropped silently.
+    const maxParticipants = 9;
+    const all = parseParticipants(readFormField(body, cfg.claimParticipantsField))
+        .filter((p) => p.toLowerCase() !== author.toLowerCase());
+    if (all.length === 0)
+        return { added: [], missing: [] };
+    const listed = all.slice(0, maxParticipants);
+    const overflow = all.slice(maxParticipants);
+    if (overflow.length)
+        core.info(`#${num}: ${all.length} participants listed; probing the first ${maxParticipants}.`);
+    try {
+        const assignable = [];
+        const rejected = [];
+        for (const login of listed) {
+            if (await canBeAssigned(repoOctokit, owner, repo, login))
+                assignable.push(login);
+            else
+                rejected.push(login);
+        }
+        await assignMany(repoOctokit, owner, repo, num, assignable);
+        const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()));
+        const added = assignable.filter((p) => after.has(p.toLowerCase()));
+        const dropped = assignable.filter((p) => !after.has(p.toLowerCase()));
+        return { added, missing: [...rejected, ...dropped, ...overflow] };
+    }
+    catch (err) {
+        core.warning(`#${num}: could not register participants (${err.message}); continuing with the author alone.`);
+        return { added: [], missing: all };
+    }
 }
 async function runPullEvent(octokit, repoOctokit, cfg, ctx, action) {
     const pr = github.context.payload.pull_request;

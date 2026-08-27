@@ -9,9 +9,9 @@ import {
   setStatus,
   setExpiry,
 } from './github/projects.js'
-import { getAssignees, assign, comment, getClosingIssueNumbers, getOpenClosingPullNumbers } from './github/issues.js'
+import { getAssignees, assign, assignMany, canBeAssigned, comment, getClosingIssueNumbers, getOpenClosingPullNumbers } from './github/issues.js'
 import { optionId } from './commands/deps.js'
-import { readFormField } from './issueForm.js'
+import { readFormField, parseParticipants } from './issueForm.js'
 
 type Octokit = ReturnType<typeof getOctokit>
 
@@ -143,6 +143,8 @@ async function autoClaimOnOpen(
     return
   }
 
+  const { added, missing } = await registerParticipants(repoOctokit, cfg, owner, repo, num, author, body)
+
   let expiry: Date | null = null
   let expiryNote = ''
   if (expiryEnabled(cfg)) {
@@ -169,16 +171,71 @@ async function autoClaimOnOpen(
 
   await setStatus(octokit, ctx, itemId, claimed)
 
-  let first = `@${author} you're now registered as working on this — no extra step needed.`
+  let first = added.length
+    ? `@${author} you're now registered as working on this together with ${added.map((a) => `@${a}`).join(', ')} — no extra step needed.`
+    : `@${author} you're now registered as working on this — no extra step needed.`
   if (expiry) first += ` This registration expires **${formatExpiry(expiry)}**.`
   if (expiryNote) first += expiryNote
+  if (missing.length) {
+    first += ` I couldn't register ${missing.map((m) => `@${m}`).join(', ')} — GitHub only lets me assign collaborators, org members, or people who have commented on the issue. Anyone listed can comment \`claim\` here to add themselves.`
+  }
   // When the form requires an absolute date, don't advertise a duration example the form would reject.
   const changeHint = cfg.claimExpiryRequireDate ? 'e.g. `claim 2026-09-01`' : 'e.g. `claim 2 weeks` or `claim 2026-09-01`'
   const second = expiryEnabled(cfg)
     ? `Comment \`claim <when>\` to change the expiry (${changeHint}), \`claim\` again to renew, or \`disclaim\` to release it.`
     : 'Comment `disclaim` to release it once you\'re done.'
   await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}`)
-  core.info(`#${num}: auto-claimed for @${author}.`)
+  core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}.`)
+}
+
+/**
+ * Register the co-participants a registrant listed in the issue form (`claim-participants-field`)
+ * alongside the author, so a group project shows every member on the board's Assignees column.
+ *
+ * Best effort by design: GitHub only accepts collaborators, org members, and prior commenters as
+ * assignees, and caps an issue at ten. Each handle is probed with `canBeAssigned` first (precise
+ * feedback), then the survivors are added in one call and re-read, since assignability can still
+ * change in the window and GitHub drops rejects silently. Whoever didn't stick is reported back
+ * for the confirmation comment, which points them at the `claim`-to-join path (commenting makes
+ * them assignable, so that path unblocks itself). A failure here never blocks the author's claim.
+ */
+async function registerParticipants(
+  repoOctokit: Octokit,
+  cfg: Config,
+  owner: string,
+  repo: string,
+  num: number,
+  author: string,
+  body: string,
+): Promise<{ added: string[]; missing: string[] }> {
+  if (!cfg.claimParticipantsField) return { added: [], missing: [] }
+  // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
+  // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
+  // is still named in the confirmation comment rather than dropped silently.
+  const maxParticipants = 9
+  const all = parseParticipants(readFormField(body, cfg.claimParticipantsField))
+    .filter((p) => p.toLowerCase() !== author.toLowerCase())
+  if (all.length === 0) return { added: [], missing: [] }
+  const listed = all.slice(0, maxParticipants)
+  const overflow = all.slice(maxParticipants)
+  if (overflow.length) core.info(`#${num}: ${all.length} participants listed; probing the first ${maxParticipants}.`)
+
+  try {
+    const assignable: string[] = []
+    const rejected: string[] = []
+    for (const login of listed) {
+      if (await canBeAssigned(repoOctokit, owner, repo, login)) assignable.push(login)
+      else rejected.push(login)
+    }
+    await assignMany(repoOctokit, owner, repo, num, assignable)
+    const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()))
+    const added = assignable.filter((p) => after.has(p.toLowerCase()))
+    const dropped = assignable.filter((p) => !after.has(p.toLowerCase()))
+    return { added, missing: [...rejected, ...dropped, ...overflow] }
+  } catch (err) {
+    core.warning(`#${num}: could not register participants (${(err as Error).message}); continuing with the author alone.`)
+    return { added: [], missing: all }
+  }
 }
 
 async function runPullEvent(octokit: Octokit, repoOctokit: Octokit, cfg: Config, ctx: ProjectContext, action: string): Promise<void> {
