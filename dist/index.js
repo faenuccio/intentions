@@ -32430,13 +32430,15 @@ function readFormField(body, label) {
     return value;
 }
 /**
- * Parse a list of GitHub handles out of a form-field value like `@alice, @bob charlie`.
+ * Parse a list of GitHub handles out of a form-field value like `@alice, @bob`.
  *
- * Handles may be separated by commas, semicolons, or any whitespace, each with or without a
- * leading `@`. Tokens that aren't a well-formed GitHub login (1–39 alphanumerics/hyphens, no
- * leading/trailing/double hyphen) are dropped rather than reported: the field is free text, so
- * stray words must not turn into assignment attempts. Duplicates collapse case-insensitively to
- * the first spelling. A null/blank value yields [].
+ * A handle must carry its `@`; handles may be separated by commas, semicolons, or any whitespace.
+ * The field is free text on a public form, so a bare word is never read as a handle: someone who
+ * types "Alice Smith and Bob Jones" means four names, and reading those as `@Alice`, `@Smith`,
+ * `@and`, `@Bob`, `@Jones` would notify (and possibly assign) unrelated accounts. Tokens that
+ * aren't a well-formed GitHub login (1–39 alphanumerics/hyphens, no leading/trailing/double
+ * hyphen) are dropped rather than reported. Duplicates collapse case-insensitively to the first
+ * spelling. A null/blank value yields [].
  */
 function parseParticipants(value) {
     if (!value)
@@ -32444,7 +32446,7 @@ function parseParticipants(value) {
     const logins = [];
     const seen = new Set();
     for (const token of value.split(/[\s,;]+/)) {
-        const m = token.match(/^@?([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/);
+        const m = token.match(/^@([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/);
         if (!m)
             continue;
         const login = m[1];
@@ -33148,10 +33150,18 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
 async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, body) {
     if (!cfg.claimParticipantsField)
         return { added: [], missing: [] };
-    const listed = parseParticipants(readFormField(body, cfg.claimParticipantsField))
+    // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
+    // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
+    // is still named in the confirmation comment rather than dropped silently.
+    const maxParticipants = 9;
+    const all = parseParticipants(readFormField(body, cfg.claimParticipantsField))
         .filter((p) => p.toLowerCase() !== author.toLowerCase());
-    if (listed.length === 0)
+    if (all.length === 0)
         return { added: [], missing: [] };
+    const listed = all.slice(0, maxParticipants);
+    const overflow = all.slice(maxParticipants);
+    if (overflow.length)
+        core.info(`#${num}: ${all.length} participants listed; probing the first ${maxParticipants}.`);
     try {
         const assignable = [];
         const rejected = [];
@@ -33165,11 +33175,11 @@ async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, 
         const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()));
         const added = assignable.filter((p) => after.has(p.toLowerCase()));
         const dropped = assignable.filter((p) => !after.has(p.toLowerCase()));
-        return { added, missing: [...rejected, ...dropped] };
+        return { added, missing: [...rejected, ...dropped, ...overflow] };
     }
     catch (err) {
         core.warning(`#${num}: could not register participants (${err.message}); continuing with the author alone.`);
-        return { added: [], missing: listed };
+        return { added: [], missing: all };
     }
 }
 async function runPullEvent(octokit, repoOctokit, cfg, ctx, action) {
