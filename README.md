@@ -102,7 +102,10 @@ issue's author is cc'd, since it is their field to correct.
 
 Every repair is announced in a comment on the issue concerned, so the registrant sees why the bot
 touched their card, and `notify-maintainers` adds a cc line naming whoever should know that a
-malformed card existed at all. Only successful repairs are announced, and each repair makes its own
+malformed card existed at all. The same line is appended to **every message that declines a
+`claim`** — a task already held, a terminal column, a closed issue, an expiry that could not be
+read, an assignment GitHub rejected — and always names the issue's author as well, so that somebody
+who can act on it hears about every attempt that failed, not merely the anomalous ones. Only successful repairs are announced, and each repair makes its own
 precondition false, so a card is announced once and never again; a repair that fails is logged as a
 warning instead of commenting on every sweep.
 
@@ -312,7 +315,7 @@ All inputs (set on the reusable workflow):
 | `participant-claim` | `false` | let the issue author and listed participants `claim` from any column, not only a free one. See [Registry mode](#registry-mode-entitlement-status-commands-and-a-well-formed-board) |
 | `status-commands` | `false` | enable the `progress` / `review` / `done` comment commands for holders |
 | `enforce-holder` | `false` | have the sweep give every card a column and assign the issue author to any active card with no holder |
-| `notify-maintainers` | `` | comma-separated logins to cc on the comment announcing an `enforce-holder` repair |
+| `notify-maintainers` | `` | comma-separated logins to cc, alongside the issue's author, whenever a `claim` is declined and on every board repair or participants warning |
 | `terminal-statuses` | `In Review,Completed` | states where a `claim` comment is refused |
 | `expiry-field` | `Claim Expires` | Text field holding the ISO 8601 UTC expiry |
 | `note-field` | `Claim Note` | optional Text field holding the freeform claim note; ignored if absent |

@@ -1,7 +1,7 @@
 import { expiryEnabled } from '../config.js'
 import { resolveExpiry, toStorage, formatExpiry } from '../ttl.js'
 import { getIssueItem, setStatus, setExpiry } from '../github/projects.js'
-import { getAssignees, getIssueBody, getIssue, assign, comment } from '../github/issues.js'
+import { getAssignees, getIssue, type IssueFacts, assign, comment } from '../github/issues.js'
 import { isEntitled } from '../entitlement.js'
 import { type Deps, optionId, requireOption, isTerminal, maintainerCc } from './deps.js'
 import { writeNote } from './note.js'
@@ -25,12 +25,19 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
   const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps
   const now = new Date()
 
+  // One read, up front: the author is needed for every cc line, and the body for entitlement, for
+  // the join path, and for diagnosing a handle the parser could not read.
+  const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
+  // Every message that declines a claim names the people who can do something about it: the
+  // registration's author, and the project's maintainers.
+  const cc = maintainerCc(cfg, [issue.author])
+
   const item = await getIssueItem(octokit, owner, repo, issueNumber, ctx)
   if (!item) {
     // An intention opened through the form should have been added automatically, so this means
     // something is wrong with the board or the workflow rather than with the commenter.
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so it can't be claimed.${maintainerCc(cfg)}`)
+      `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so it can't be claimed.${cc}`)
     return
   }
 
@@ -56,7 +63,7 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
     }
     const res = resolveExpiry(expiryArg, now, cfg.defaultTtl, cfg.maxTtlMs)
     if (!res.ok) {
-      await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}`)
+      await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}${cc}`)
       return
     }
     await setExpiry(octokit, ctx, item.itemId, toStorage(res.expiry))
@@ -67,31 +74,28 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
   }
 
   // ---- Entitled path: the author and declared participants are never turned away ----
-  if (cfg.participantClaim) {
-    const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
-    if (isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField)) {
-      await registerEntitled(deps, item, assignees, expiryArg, note, issue.state)
-      return
-    }
+  if (cfg.participantClaim && isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField)) {
+    await registerEntitled(deps, item, assignees, expiryArg, note, issue.state, cc)
+    return
   }
 
   // ---- Fresh claim path: enforce guardrails --------------------------------
   if (isTerminal(cfg, statusName)) {
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} this task is **${statusName}**, so there's nothing to claim.`)
+      `@${actor} this task is **${statusName}**, so there's nothing to claim.${cc}`)
     return
   }
   if (item.statusOptionId !== unclaimedId || assignees.length > 0) {
     // A held task refuses new claimants — unless the actor is on the registration's invitation
     // list, in which case `claim` means "join" rather than "take over".
-    if (await tryJoinAsParticipant(deps, item, assignees, expiryArg, note)) return
+    if (await tryJoinAsParticipant(deps, item, assignees, expiryArg, note, issue.body, cc)) return
     // Before turning somebody away as a stranger, check whether they were meant to be a
     // participant and only a mistyped handle stands in the way; that is a fault to report, not a
     // refusal to explain away.
-    if (await explainUnreadableHandle(deps)) return
+    if (await explainUnreadableHandle(deps, issue, cc)) return
     const who = assignees.length ? assignees.map((a) => `@${a}`).join(', ') : 'someone'
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} this task isn't available — it's currently **${statusName ?? 'not Unclaimed'}** (held by ${who}). It will free up if the claim is disclaimed or expires.`)
+      `@${actor} this task isn't available — it's currently **${statusName ?? 'not Unclaimed'}** (held by ${who}). It will free up if the claim is disclaimed or expires.${cc}`)
     return
   }
 
@@ -107,7 +111,7 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
 
   const res = resolveExpiry(expiryArg, now, cfg.defaultTtl, cfg.maxTtlMs)
   if (!res.ok) {
-    await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}`)
+    await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}${cc}`)
     return
   }
 
@@ -134,15 +138,14 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
  * it fires exactly when somebody has been made invisible by a typing slip. Returns true when it has
  * answered the comment, so the caller skips the ordinary refusal.
  */
-async function explainUnreadableHandle(deps: Deps): Promise<boolean> {
+async function explainUnreadableHandle(deps: Deps, issue: IssueFacts, cc: string): Promise<boolean> {
   const { repoOctokit, cfg, owner, repo, issueNumber, actor } = deps
   if (!cfg.claimParticipantsField) return false
-  const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
   const { unreadable } = scanParticipants(readFormField(issue.body, cfg.claimParticipantsField))
   const mine = unreadable.find((t) => t.replace(/^@/, '').toLowerCase() === actor.toLowerCase())
   if (!mine) return false
   await comment(repoOctokit, owner, repo, issueNumber,
-    `@${actor} you're named in the "${cfg.claimParticipantsField}" field as \`${mine.replace(/`/g, '')}\`, but without the leading \`@\` a handle isn't recognised, so I couldn't treat you as a participant. Once the field reads \`@${actor}\`, comment \`claim\` again and I'll register you.${maintainerCc(cfg, [issue.author])}`)
+    `@${actor} you're named in the "${cfg.claimParticipantsField}" field as \`${mine.replace(/`/g, '')}\`, but without the leading \`@\` a handle isn't recognised, so I couldn't treat you as a participant. Once the field reads \`@${actor}\`, comment \`claim\` again and I'll register you.${cc}`)
   return true
 }
 
@@ -164,12 +167,13 @@ async function registerEntitled(
   expiryArg: string,
   note: string,
   issueState: 'open' | 'closed',
+  cc: string,
 ): Promise<void> {
   const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps
 
   if (issueState === 'closed') {
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} this issue is closed, so I've left the board alone. Reopen it and comment \`claim\` again to register.`)
+      `@${actor} this issue is closed, so I've left the board alone. Reopen it and comment \`claim\` again to register.${cc}`)
     return
   }
 
@@ -178,7 +182,7 @@ async function registerEntitled(
   if (expiryEnabled(cfg)) {
     const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs)
     if (!res.ok) {
-      await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}`)
+      await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}${cc}`)
       return
     }
     expiry = res.expiry
@@ -188,7 +192,7 @@ async function registerEntitled(
   const after = await getAssignees(repoOctokit, owner, repo, issueNumber)
   if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${maintainerCc(cfg)}`)
+      `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${cc}`)
     return
   }
 
@@ -230,6 +234,8 @@ async function tryJoinAsParticipant(
   assignees: string[],
   expiryArg: string,
   note: string,
+  body: string,
+  cc: string,
 ): Promise<boolean> {
   const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps
   if (!cfg.claimParticipantsField) return false
@@ -239,7 +245,6 @@ async function tryJoinAsParticipant(
   if (!active || assignees.length === 0) return false
   if (assignees.some((a) => a.toLowerCase() === actor.toLowerCase())) return false
 
-  const body = await getIssueBody(repoOctokit, owner, repo, issueNumber)
   const listed = parseParticipants(readFormField(body, cfg.claimParticipantsField))
   if (!listed.some((p) => p.toLowerCase() === actor.toLowerCase())) return false
 
@@ -249,7 +254,7 @@ async function tryJoinAsParticipant(
   const after = await getAssignees(repoOctokit, owner, repo, issueNumber)
   if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} you're listed as a participant here, but GitHub didn't accept the assignment, so I couldn't register you on this task.`)
+      `@${actor} you're listed as a participant here, but GitHub didn't accept the assignment, so I couldn't register you on this task.${cc}`)
     return true
   }
 
@@ -262,7 +267,7 @@ async function tryJoinAsParticipant(
       line += ` The registration now expires **${formatExpiry(res.expiry)}**.`
     } else {
       // Forgiving like auto-claim: the join stands, only the expiry change is declined.
-      line += ` I've left the shared expiry unchanged, though — ${res.reason}`
+      line += ` I've left the shared expiry unchanged, though — ${res.reason}${cc}`
     }
   }
   await writeNote(deps, item.itemId, note)
