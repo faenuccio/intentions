@@ -2,6 +2,8 @@ import * as core from '@actions/core'
 import type { getOctokit } from '@actions/github'
 import { type Config, expiryEnabled } from './config.js'
 import { formatExpiry, toStorage, MS_PER_DAY } from './ttl.js'
+import { readFormField, scanParticipants } from './issueForm.js'
+import { maintainerCc } from './commands/deps.js'
 import {
   type ProjectContext,
   type ClaimedItem,
@@ -12,7 +14,7 @@ import {
   clearExpiry,
   clearNote,
 } from './github/projects.js'
-import { getAssignees, assign, unassign, comment } from './github/issues.js'
+import { getAssignees, assign, unassign, comment, issueHasMarker } from './github/issues.js'
 
 type Octokit = ReturnType<typeof getOctokit>
 
@@ -101,12 +103,21 @@ async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Con
     const id = ctx.statusOptionIdByName.get(name.toLowerCase())
     if (id) active.add(id)
   }
+  // Holder repairs concern the active columns, but the participants audit concerns every card, so
+  // enumerate the whole board in one query and let each check pick what it cares about.
+  const everywhere = new Set<string>([...active, unclaimedId])
+  for (const name of [cfg.statusCompleted, ...cfg.terminalStatuses]) {
+    const id = ctx.statusOptionIdByName.get(name.toLowerCase())
+    if (id) everywhere.add(id)
+  }
 
-  const items = await listItemsByStatus(octokit, ctx, active, { includeStatusless: true })
+  const items = await listItemsByStatus(octokit, ctx, everywhere, { includeStatusless: true })
   let placed = 0
   let filled = 0
   for (const it of items) {
     try {
+      await auditParticipants(repoOctokit, cfg, it)
+      if (it.statusOptionId !== null && !active.has(it.statusOptionId)) continue
       if (it.statusOptionId === null) {
         const held = it.assignees.length > 0
         const columnName = held ? cfg.statusClaimed : cfg.statusUnclaimed
@@ -140,6 +151,36 @@ async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Con
 }
 
 /**
+ * Report a participants field naming somebody the parser cannot read, on every card, for as long as
+ * the fault persists.
+ *
+ * Unlike a holder repair, this is not something the bot can put right: only a human can add the
+ * missing `@`. Such a check therefore needs a memory, or it would repeat itself every few hours.
+ * The memory is a hidden marker in the comment it posts, listing exactly what was unreadable, so
+ * the warning is repeated when — and only when — the set of unreadable names changes. The author is
+ * cc'd because it is their field to correct, and the maintainers because a registration silently
+ * naming nobody is precisely the sort of fault that otherwise goes unnoticed.
+ */
+async function auditParticipants(repoOctokit: Octokit, cfg: Config, it: ClaimedItem): Promise<void> {
+  if (!cfg.claimParticipantsField || !it.issueOwner || !it.issueRepo) return
+  const { unreadable } = scanParticipants(readFormField(it.body, cfg.claimParticipantsField))
+  if (unreadable.length === 0) return
+
+  const key = [...unreadable].map((t) => t.toLowerCase()).sort().join(',')
+  const marker = `<!-- intentions:participants-unreadable ${key} -->`
+  try {
+    if (await issueHasMarker(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, marker)) return
+    const shown = unreadable.slice(0, 5).map((t) => `\`${t.replace(/`/g, '')}\``).join(', ')
+    const more = unreadable.length > 5 ? `, and ${unreadable.length - 5} more` : ''
+    await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber,
+      `:warning: The "${cfg.claimParticipantsField}" field names ${shown}${more}, which I can't read as GitHub handles — each one needs its leading \`@\`, as in \`@alice\`. Until the field is corrected these people aren't registered, and \`claim\` won't recognise them either.${maintainerCc(cfg, [it.author])}\n\n${marker}`)
+    core.info(`#${it.issueNumber}: reported ${unreadable.length} unreadable participant name(s).`)
+  } catch (err) {
+    core.warning(`#${it.issueNumber}: could not audit participants: ${(err as Error).message}`)
+  }
+}
+
+/**
  * Announce a repair on the issue it was made to, so the registrant sees why the bot touched their
  * card, and cc the maintainers named in `notify-maintainers` so somebody responsible learns that a
  * malformed card existed at all — these shapes come from board edits made by hand, which no webhook
@@ -151,11 +192,10 @@ async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Con
  * the reconciliation: the repair itself has already landed and matters more than its announcement.
  */
 async function reportRepair(repoOctokit: Octokit, cfg: Config, it: ClaimedItem, what: string): Promise<void> {
-  const cc = cfg.notifyMaintainers.length
-    ? `\n\ncc ${cfg.notifyMaintainers.map((m) => `@${m}`).join(' ')} — this usually follows a board edit made by hand.`
-    : ''
+  const cc = maintainerCc(cfg, [it.author])
   try {
-    await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:wrench: ${what}${cc}`)
+    await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber,
+      `:wrench: ${what}${cc}${cc ? ' — a card in this shape usually follows a board edit made by hand.' : ''}`)
   } catch (err) {
     core.warning(`#${it.issueNumber}: repaired, but could not comment: ${(err as Error).message}`)
   }

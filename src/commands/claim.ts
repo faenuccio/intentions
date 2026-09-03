@@ -3,9 +3,9 @@ import { resolveExpiry, toStorage, formatExpiry } from '../ttl.js'
 import { getIssueItem, setStatus, setExpiry } from '../github/projects.js'
 import { getAssignees, getIssueBody, getIssue, assign, comment } from '../github/issues.js'
 import { isEntitled } from '../entitlement.js'
-import { type Deps, optionId, requireOption, isTerminal } from './deps.js'
+import { type Deps, optionId, requireOption, isTerminal, maintainerCc } from './deps.js'
 import { writeNote } from './note.js'
-import { readFormField, parseParticipants } from '../issueForm.js'
+import { readFormField, parseParticipants, scanParticipants } from '../issueForm.js'
 
 /**
  * Handle `claim [expiry]` plus an optional freeform note (the lines following the command).
@@ -27,8 +27,10 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
 
   const item = await getIssueItem(octokit, owner, repo, issueNumber, ctx)
   if (!item) {
+    // An intention opened through the form should have been added automatically, so this means
+    // something is wrong with the board or the workflow rather than with the commenter.
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} this issue isn't on the **${cfg.projectTitle}** board yet, so it can't be claimed. A maintainer needs to add it first.`)
+      `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so it can't be claimed.${maintainerCc(cfg)}`)
     return
   }
 
@@ -83,6 +85,10 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
     // A held task refuses new claimants — unless the actor is on the registration's invitation
     // list, in which case `claim` means "join" rather than "take over".
     if (await tryJoinAsParticipant(deps, item, assignees, expiryArg, note)) return
+    // Before turning somebody away as a stranger, check whether they were meant to be a
+    // participant and only a mistyped handle stands in the way; that is a fault to report, not a
+    // refusal to explain away.
+    if (await explainUnreadableHandle(deps)) return
     const who = assignees.length ? assignees.map((a) => `@${a}`).join(', ') : 'someone'
     await comment(repoOctokit, owner, repo, issueNumber,
       `@${actor} this task isn't available — it's currently **${statusName ?? 'not Unclaimed'}** (held by ${who}). It will free up if the claim is disclaimed or expires.`)
@@ -118,6 +124,26 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
     lines.push(`That's the project default. To set your own, comment e.g. \`claim 2w\`, \`claim 5 hours\`, or \`claim 2026-08-01\` — and \`claim <when>\` again any time to extend.`)
   }
   await comment(repoOctokit, owner, repo, issueNumber, lines.join('\n\n'))
+}
+
+/**
+ * Was this commenter meant to be a participant, but written without the leading `@` the parser
+ * requires? If so, say precisely that, and tell the people who can put it right.
+ *
+ * The comparison is against the tokens the parser rejected, not against the handles it accepted, so
+ * it fires exactly when somebody has been made invisible by a typing slip. Returns true when it has
+ * answered the comment, so the caller skips the ordinary refusal.
+ */
+async function explainUnreadableHandle(deps: Deps): Promise<boolean> {
+  const { repoOctokit, cfg, owner, repo, issueNumber, actor } = deps
+  if (!cfg.claimParticipantsField) return false
+  const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
+  const { unreadable } = scanParticipants(readFormField(issue.body, cfg.claimParticipantsField))
+  const mine = unreadable.find((t) => t.replace(/^@/, '').toLowerCase() === actor.toLowerCase())
+  if (!mine) return false
+  await comment(repoOctokit, owner, repo, issueNumber,
+    `@${actor} you're named in the "${cfg.claimParticipantsField}" field as \`${mine.replace(/`/g, '')}\`, but without the leading \`@\` a handle isn't recognised, so I couldn't treat you as a participant. Once the field reads \`@${actor}\`, comment \`claim\` again and I'll register you.${maintainerCc(cfg, [issue.author])}`)
+  return true
 }
 
 /**
@@ -162,7 +188,7 @@ async function registerEntitled(
   const after = await getAssignees(repoOctokit, owner, repo, issueNumber)
   if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
     await comment(repoOctokit, owner, repo, issueNumber,
-      `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.`)
+      `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${maintainerCc(cfg)}`)
     return
   }
 

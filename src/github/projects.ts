@@ -253,6 +253,8 @@ export interface ClaimedItem {
   assignees: string[]
   /** login of whoever opened the issue; the fallback holder when enforce-holder is on */
   author: string
+  /** the issue body, so a reconciling pass can read its form fields without a request per card */
+  body: string
   statusOptionId: string | null
   expiryText: string | null
 }
@@ -276,7 +278,7 @@ export async function listItemsByStatus(
     const res: {
       node: { items: { nodes: {
         id: string
-        content: { __typename: string; number?: number; author?: { login: string } | null; assignees?: { nodes: { login: string }[] }; repository?: { name: string; owner: { login: string } } } | null
+        content: { __typename: string; number?: number; body?: string; author?: { login: string } | null; assignees?: { nodes: { login: string }[] }; repository?: { name: string; owner: { login: string } } } | null
         fieldValues: { nodes: FieldValue[]; pageInfo: { hasNextPage: boolean } }
       }[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
     } = await octokit.graphql(
@@ -287,7 +289,7 @@ export async function listItemsByStatus(
               id
               content{
                 __typename
-                ... on Issue { number author{ login } assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
+                ... on Issue { number body author{ login } assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
               }
               ${ITEM_FIELD_VALUES}
             }
@@ -314,6 +316,7 @@ export async function listItemsByStatus(
         issueRepo: it.content.repository?.name ?? '',
         assignees: (it.content.assignees?.nodes ?? []).map((a) => a.login),
         author: it.content.author?.login ?? '',
+        body: it.content.body ?? '',
         statusOptionId: state.statusOptionId,
         expiryText: state.expiryText,
       })

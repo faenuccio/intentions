@@ -94,6 +94,12 @@ report:
 | A card with no status at all | Placed in the claimed column if somebody is assigned, otherwise in the unclaimed one. |
 | A card in an active column with no assignee | The issue author is assigned. |
 
+The same pass audits every card's participants field, in every column, and reports any name it
+cannot read as a handle — the leading `@` being required. That fault is not one the bot can repair,
+only a human can, so the warning carries a hidden marker listing exactly what was unreadable: it is
+repeated when, and only when, that set changes, and never merely because the fault persists. The
+issue's author is cc'd, since it is their field to correct.
+
 Every repair is announced in a comment on the issue concerned, so the registrant sees why the bot
 touched their card, and `notify-maintainers` adds a cc line naming whoever should know that a
 malformed card existed at all. Only successful repairs are announced, and each repair makes its own

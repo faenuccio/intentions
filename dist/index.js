@@ -32177,7 +32177,7 @@ async function listItemsByStatus(octokit, ctx, statusOptionIds, opts = {}) {
               id
               content{
                 __typename
-                ... on Issue { number author{ login } assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
+                ... on Issue { number body author{ login } assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
               }
               ${ITEM_FIELD_VALUES}
             }
@@ -32206,6 +32206,7 @@ async function listItemsByStatus(octokit, ctx, statusOptionIds, opts = {}) {
                 issueRepo: it.content.repository?.name ?? '',
                 assignees: (it.content.assignees?.nodes ?? []).map((a) => a.login),
                 author: it.content.author?.login ?? '',
+                body: it.content.body ?? '',
                 statusOptionId: state.statusOptionId,
                 expiryText: state.expiryText,
             });
@@ -32350,6 +32351,19 @@ async function assignMany(octokit, owner, repo, issue_number, logins) {
 async function unassign(octokit, owner, repo, issue_number, login) {
     await octokit.rest.issues.removeAssignees({ owner, repo, issue_number, assignees: [login] });
 }
+/**
+ * Has any comment on this issue carried `marker` already?
+ *
+ * State kept in the thread rather than on the board, in the manner of the `Closes #N` linker: a
+ * warning about something only a human can fix — a mistyped handle, say — does not become false by
+ * being reported, so without a record of having said it the bot would repeat itself on every sweep.
+ * The marker embeds what was reported, so a warning is repeated when, and only when, the underlying
+ * problem changes.
+ */
+async function issueHasMarker(octokit, owner, repo, issue_number, marker) {
+    const comments = await octokit.paginate(octokit.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+    return comments.some((c) => (c.body ?? '').includes(marker));
+}
 async function comment(octokit, owner, repo, issue_number, body) {
     await octokit.rest.issues.createComment({ owner, repo, issue_number, body });
 }
@@ -32480,6 +32494,24 @@ function isEntitled(actor, issueAuthor, issueBody, participantsField) {
 }
 
 ;// CONCATENATED MODULE: ./src/commands/deps.ts
+/**
+ * The trailing "cc" line for a message that somebody responsible ought to see: a card the bot
+ * cannot act on, or a registration that will not work until a human edits it. Empty when the
+ * project has named nobody, so the message still stands on its own.
+ */
+function maintainerCc(cfg, alsoMention = []) {
+    const seen = new Set();
+    const who = [...alsoMention, ...cfg.notifyMaintainers]
+        .map((m) => m.replace(/^@/, ''))
+        .filter((m) => {
+        const k = m.toLowerCase();
+        if (!m || seen.has(k))
+            return false;
+        seen.add(k);
+        return true;
+    });
+    return who.length ? `\n\ncc ${who.map((m) => `@${m}`).join(' ')}` : '';
+}
 function optionId(ctx, name) {
     return ctx.statusOptionIdByName.get(name.toLowerCase()) ?? null;
 }
@@ -32556,7 +32588,9 @@ async function handleClaim(deps, expiryArg, note) {
     const now = new Date();
     const item = await getIssueItem(octokit, owner, repo, issueNumber, ctx);
     if (!item) {
-        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue isn't on the **${cfg.projectTitle}** board yet, so it can't be claimed. A maintainer needs to add it first.`);
+        // An intention opened through the form should have been added automatically, so this means
+        // something is wrong with the board or the workflow rather than with the commenter.
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so it can't be claimed.${maintainerCc(cfg)}`);
         return;
     }
     const assignees = await getAssignees(repoOctokit, owner, repo, issueNumber);
@@ -32605,6 +32639,11 @@ async function handleClaim(deps, expiryArg, note) {
         // list, in which case `claim` means "join" rather than "take over".
         if (await tryJoinAsParticipant(deps, item, assignees, expiryArg, note))
             return;
+        // Before turning somebody away as a stranger, check whether they were meant to be a
+        // participant and only a mistyped handle stands in the way; that is a fault to report, not a
+        // refusal to explain away.
+        if (await explainUnreadableHandle(deps))
+            return;
         const who = assignees.length ? assignees.map((a) => `@${a}`).join(', ') : 'someone';
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this task isn't available — it's currently **${statusName ?? 'not Unclaimed'}** (held by ${who}). It will free up if the claim is disclaimed or expires.`);
         return;
@@ -32637,6 +32676,26 @@ async function handleClaim(deps, expiryArg, note) {
     await comment(repoOctokit, owner, repo, issueNumber, lines.join('\n\n'));
 }
 /**
+ * Was this commenter meant to be a participant, but written without the leading `@` the parser
+ * requires? If so, say precisely that, and tell the people who can put it right.
+ *
+ * The comparison is against the tokens the parser rejected, not against the handles it accepted, so
+ * it fires exactly when somebody has been made invisible by a typing slip. Returns true when it has
+ * answered the comment, so the caller skips the ordinary refusal.
+ */
+async function explainUnreadableHandle(deps) {
+    const { repoOctokit, cfg, owner, repo, issueNumber, actor } = deps;
+    if (!cfg.claimParticipantsField)
+        return false;
+    const issue = await getIssue(repoOctokit, owner, repo, issueNumber);
+    const { unreadable } = scanParticipants(readFormField(issue.body, cfg.claimParticipantsField));
+    const mine = unreadable.find((t) => t.replace(/^@/, '').toLowerCase() === actor.toLowerCase());
+    if (!mine)
+        return false;
+    await comment(repoOctokit, owner, repo, issueNumber, `@${actor} you're named in the "${cfg.claimParticipantsField}" field as \`${mine.replace(/`/g, '')}\`, but without the leading \`@\` a handle isn't recognised, so I couldn't treat you as a participant. Once the field reads \`@${actor}\`, comment \`claim\` again and I'll register you.${maintainerCc(cfg, [issue.author])}`);
+    return true;
+}
+/**
  * Register an entitled commenter — the issue's author, or somebody they declared as a participant
  * — whatever column the card is in.
  *
@@ -32666,7 +32725,7 @@ async function registerEntitled(deps, item, assignees, expiryArg, note, issueSta
     await issues_assign(repoOctokit, owner, repo, issueNumber, actor);
     const after = await getAssignees(repoOctokit, owner, repo, issueNumber);
     if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
-        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.`);
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${maintainerCc(cfg)}`);
         return;
     }
     const claimedId = requireOption(ctx, cfg.statusClaimed);
@@ -33035,6 +33094,8 @@ async function handleStatus(deps, target) {
 
 
 
+
+
 function sameSet(a, b) {
     if (a.length !== b.length)
         return false;
@@ -33120,11 +33181,22 @@ async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
         if (id)
             active.add(id);
     }
-    const items = await listItemsByStatus(octokit, ctx, active, { includeStatusless: true });
+    // Holder repairs concern the active columns, but the participants audit concerns every card, so
+    // enumerate the whole board in one query and let each check pick what it cares about.
+    const everywhere = new Set([...active, unclaimedId]);
+    for (const name of [cfg.statusCompleted, ...cfg.terminalStatuses]) {
+        const id = ctx.statusOptionIdByName.get(name.toLowerCase());
+        if (id)
+            everywhere.add(id);
+    }
+    const items = await listItemsByStatus(octokit, ctx, everywhere, { includeStatusless: true });
     let placed = 0;
     let filled = 0;
     for (const it of items) {
         try {
+            await auditParticipants(repoOctokit, cfg, it);
+            if (it.statusOptionId !== null && !active.has(it.statusOptionId))
+                continue;
             if (it.statusOptionId === null) {
                 const held = it.assignees.length > 0;
                 const columnName = held ? cfg.statusClaimed : cfg.statusUnclaimed;
@@ -33157,6 +33229,37 @@ async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
     core.info(`Holder reconciliation: ${placed} card(s) placed, ${filled} holder(s) restored.`);
 }
 /**
+ * Report a participants field naming somebody the parser cannot read, on every card, for as long as
+ * the fault persists.
+ *
+ * Unlike a holder repair, this is not something the bot can put right: only a human can add the
+ * missing `@`. Such a check therefore needs a memory, or it would repeat itself every few hours.
+ * The memory is a hidden marker in the comment it posts, listing exactly what was unreadable, so
+ * the warning is repeated when — and only when — the set of unreadable names changes. The author is
+ * cc'd because it is their field to correct, and the maintainers because a registration silently
+ * naming nobody is precisely the sort of fault that otherwise goes unnoticed.
+ */
+async function auditParticipants(repoOctokit, cfg, it) {
+    if (!cfg.claimParticipantsField || !it.issueOwner || !it.issueRepo)
+        return;
+    const { unreadable } = scanParticipants(readFormField(it.body, cfg.claimParticipantsField));
+    if (unreadable.length === 0)
+        return;
+    const key = [...unreadable].map((t) => t.toLowerCase()).sort().join(',');
+    const marker = `<!-- intentions:participants-unreadable ${key} -->`;
+    try {
+        if (await issueHasMarker(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, marker))
+            return;
+        const shown = unreadable.slice(0, 5).map((t) => `\`${t.replace(/`/g, '')}\``).join(', ');
+        const more = unreadable.length > 5 ? `, and ${unreadable.length - 5} more` : '';
+        await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:warning: The "${cfg.claimParticipantsField}" field names ${shown}${more}, which I can't read as GitHub handles — each one needs its leading \`@\`, as in \`@alice\`. Until the field is corrected these people aren't registered, and \`claim\` won't recognise them either.${maintainerCc(cfg, [it.author])}\n\n${marker}`);
+        core.info(`#${it.issueNumber}: reported ${unreadable.length} unreadable participant name(s).`);
+    }
+    catch (err) {
+        core.warning(`#${it.issueNumber}: could not audit participants: ${err.message}`);
+    }
+}
+/**
  * Announce a repair on the issue it was made to, so the registrant sees why the bot touched their
  * card, and cc the maintainers named in `notify-maintainers` so somebody responsible learns that a
  * malformed card existed at all — these shapes come from board edits made by hand, which no webhook
@@ -33168,11 +33271,9 @@ async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
  * the reconciliation: the repair itself has already landed and matters more than its announcement.
  */
 async function reportRepair(repoOctokit, cfg, it, what) {
-    const cc = cfg.notifyMaintainers.length
-        ? `\n\ncc ${cfg.notifyMaintainers.map((m) => `@${m}`).join(' ')} — this usually follows a board edit made by hand.`
-        : '';
+    const cc = maintainerCc(cfg, [it.author]);
     try {
-        await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:wrench: ${what}${cc}`);
+        await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:wrench: ${what}${cc}${cc ? ' — a card in this shape usually follows a board edit made by hand.' : ''}`);
     }
     catch (err) {
         core.warning(`#${it.issueNumber}: repaired, but could not comment: ${err.message}`);
