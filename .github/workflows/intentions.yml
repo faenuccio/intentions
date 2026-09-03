@@ -52,6 +52,10 @@ on:
         required: false
         type: boolean
         default: false
+      notify-maintainers:
+        required: false
+        type: string
+        default: ''
       auto-add:
         required: false
         type: boolean
@@ -228,6 +232,7 @@ jobs:
           status-in-progress: ${{ inputs.status-in-progress }}
           status-in-review: ${{ inputs.status-in-review }}
           enforce-holder: ${{ inputs.enforce-holder }}
+          notify-maintainers: ${{ inputs.notify-maintainers }}
           expiry-field: ${{ inputs.expiry-field }}
           default-ttl: ${{ inputs.default-ttl }}
           expire-in-progress: ${{ inputs.expire-in-progress }}

@@ -11,7 +11,7 @@ import {
 } from './github/projects.js'
 import { getAssignees, assign, assignMany, canBeAssigned, comment, getClosingIssueNumbers, getOpenClosingPullNumbers } from './github/issues.js'
 import { optionId } from './commands/deps.js'
-import { readFormField, parseParticipants } from './issueForm.js'
+import { readFormField, scanParticipants } from './issueForm.js'
 
 type Octokit = ReturnType<typeof getOctokit>
 
@@ -186,10 +186,13 @@ async function autoClaimOnOpen(
   if (missing.length) {
     first += ` I couldn't register ${missing.map((m) => `@${m}`).join(', ')} — GitHub only lets me assign collaborators, org members, or people who have commented on the issue. Anyone listed can comment \`claim\` here to add themselves.`
   }
-  if (unreadable) {
-    // Handles must carry a leading @, so that ordinary prose in the field cannot be mistaken for
-    // an assignment. Say so rather than registering nobody in silence.
-    first += ` I couldn't read any GitHub handles in the "${cfg.claimParticipantsField}" field, which says ${JSON.stringify(unreadable)} — handles need a leading \`@\`, as in \`@alice\`. Edit the issue to correct them, and they can then comment \`claim\` to join.`
+  if (unreadable.length) {
+    // A handle must carry a leading @, so that ordinary prose in a free-text field cannot be
+    // mistaken for an assignment. Name each token that was dropped, rather than leaving somebody
+    // unregistered with nothing to explain why.
+    const shown = unreadable.slice(0, 5).map((t) => `\`${t.replace(/`/g, '')}\``).join(', ')
+    const more = unreadable.length > 5 ? `, and ${unreadable.length - 5} more` : ''
+    first += ` I couldn't read ${shown}${more} in the "${cfg.claimParticipantsField}" field as GitHub handles — each one needs its leading \`@\`, as in \`@alice\`. Edit the issue to correct them, and they can then comment \`claim\` to join.`
   }
   // When the form requires an absolute date, don't advertise a duration example the form would reject.
   const changeHint = cfg.claimExpiryRequireDate ? 'e.g. `claim 2026-09-01`' : 'e.g. `claim 2 weeks` or `claim 2026-09-01`'
@@ -219,20 +222,16 @@ async function registerParticipants(
   num: number,
   author: string,
   body: string,
-): Promise<{ added: string[]; missing: string[]; unreadable: string }> {
-  if (!cfg.claimParticipantsField) return { added: [], missing: [], unreadable: '' }
+): Promise<{ added: string[]; missing: string[]; unreadable: string[] }> {
+  if (!cfg.claimParticipantsField) return { added: [], missing: [], unreadable: [] }
   // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
   // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
   // is still named in the confirmation comment rather than dropped silently.
   const maxParticipants = 9
-  const raw = readFormField(body, cfg.claimParticipantsField)
-  const all = parseParticipants(raw).filter((p) => p.toLowerCase() !== author.toLowerCase())
-  if (all.length === 0) {
-    // The field was filled in, yet nothing in it parsed as a handle — almost always a missing `@`,
-    // which the parser requires so that ordinary prose cannot be mistaken for an assignment. Report
-    // it rather than registering nobody in silence.
-    return { added: [], missing: [], unreadable: raw ? raw.slice(0, 120) : '' }
-  }
+  const scan = scanParticipants(readFormField(body, cfg.claimParticipantsField))
+  const unreadable = scan.unreadable
+  const all = scan.logins.filter((p) => p.toLowerCase() !== author.toLowerCase())
+  if (all.length === 0) return { added: [], missing: [], unreadable }
   const listed = all.slice(0, maxParticipants)
   const overflow = all.slice(maxParticipants)
   if (overflow.length) core.info(`#${num}: ${all.length} participants listed; probing the first ${maxParticipants}.`)
@@ -248,10 +247,10 @@ async function registerParticipants(
     const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()))
     const added = assignable.filter((p) => after.has(p.toLowerCase()))
     const dropped = assignable.filter((p) => !after.has(p.toLowerCase()))
-    return { added, missing: [...rejected, ...dropped, ...overflow], unreadable: '' }
+    return { added, missing: [...rejected, ...dropped, ...overflow], unreadable }
   } catch (err) {
     core.warning(`#${num}: could not register participants (${(err as Error).message}); continuing with the author alone.`)
-    return { added: [], missing: all, unreadable: '' }
+    return { added: [], missing: all, unreadable }
   }
 }
 

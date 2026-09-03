@@ -94,6 +94,12 @@ report:
 | A card with no status at all | Placed in the claimed column if somebody is assigned, otherwise in the unclaimed one. |
 | A card in an active column with no assignee | The issue author is assigned. |
 
+Every repair is announced in a comment on the issue concerned, so the registrant sees why the bot
+touched their card, and `notify-maintainers` adds a cc line naming whoever should know that a
+malformed card existed at all. Only successful repairs are announced, and each repair makes its own
+precondition false, so a card is announced once and never again; a repair that fails is logged as a
+warning instead of commenting on every sweep.
+
 Both matter because `claim` otherwise refuses them: a statusless card as "not Unclaimed", and an
 unheld active card as "held by someone" — naming a holder who does not exist. The author is a
 **fallback only**, applied when the assignee list is empty, so an explicit choice by the bot or by a
@@ -300,6 +306,7 @@ All inputs (set on the reusable workflow):
 | `participant-claim` | `false` | let the issue author and listed participants `claim` from any column, not only a free one. See [Registry mode](#registry-mode-entitlement-status-commands-and-a-well-formed-board) |
 | `status-commands` | `false` | enable the `progress` / `review` / `done` comment commands for holders |
 | `enforce-holder` | `false` | have the sweep give every card a column and assign the issue author to any active card with no holder |
+| `notify-maintainers` | `` | comma-separated logins to cc on the comment announcing an `enforce-holder` repair |
 | `terminal-statuses` | `In Review,Completed` | states where a `claim` comment is refused |
 | `expiry-field` | `Claim Expires` | Text field holding the ISO 8601 UTC expiry |
 | `note-field` | `Claim Note` | optional Text field holding the freeform claim note; ignored if absent |

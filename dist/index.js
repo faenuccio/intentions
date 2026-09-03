@@ -31936,6 +31936,10 @@ function readConfig() {
         claimParticipantsField: core.getInput('claim-participants-field') || '',
         participantClaim: boolInput('participant-claim', false),
         enforceHolder: boolInput('enforce-holder', false),
+        notifyMaintainers: (core.getInput('notify-maintainers') || '')
+            .split(',')
+            .map((s) => s.trim().replace(/^@/, ''))
+            .filter(Boolean),
         statusCommands: boolInput('status-commands', false),
     };
 }
@@ -32412,25 +32416,32 @@ function readFormField(body, label) {
     return value;
 }
 /**
- * Parse a list of GitHub handles out of a form-field value like `@alice, @bob`.
+ * Split a participants field into the handles it names and the tokens it does not.
  *
- * A handle must carry its `@`; handles may be separated by commas, semicolons, or any whitespace.
- * The field is free text on a public form, so a bare word is never read as a handle: someone who
- * types "Alice Smith and Bob Jones" means four names, and reading those as `@Alice`, `@Smith`,
- * `@and`, `@Bob`, `@Jones` would notify (and possibly assign) unrelated accounts. Tokens that
- * aren't a well-formed GitHub login (1–39 alphanumerics/hyphens, no leading/trailing/double
- * hyphen) are dropped rather than reported. Duplicates collapse case-insensitively to the first
- * spelling. A null/blank value yields [].
+ * The leading `@` is required, so that ordinary prose in a free-text field cannot be mistaken for
+ * an assignment. That makes a missing `@` the overwhelmingly common mistake, and silently dropping
+ * it leaves somebody unregistered with nothing to explain why — so the rejects are returned rather
+ * than discarded, for the caller to report back.
  */
-function parseParticipants(value) {
-    if (!value)
-        return [];
+function scanParticipants(value) {
     const logins = [];
+    const unreadable = [];
+    if (!value)
+        return { logins, unreadable };
     const seen = new Set();
+    const seenBad = new Set();
     for (const token of value.split(/[\s,;]+/)) {
-        const m = token.match(/^@([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/);
-        if (!m)
+        if (!token)
             continue;
+        const m = token.match(/^@([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})$/);
+        if (!m) {
+            const key = token.toLowerCase();
+            if (!seenBad.has(key)) {
+                seenBad.add(key);
+                unreadable.push(token);
+            }
+            continue;
+        }
         const login = m[1];
         const key = login.toLowerCase();
         if (seen.has(key))
@@ -32438,7 +32449,11 @@ function parseParticipants(value) {
         seen.add(key);
         logins.push(login);
     }
-    return logins;
+    return { logins, unreadable };
+}
+/** The handles named in a participants field; see {@link scanParticipants} for the rejects. */
+function parseParticipants(value) {
+    return scanParticipants(value).logins;
 }
 
 ;// CONCATENATED MODULE: ./src/entitlement.ts
@@ -33112,9 +33127,11 @@ async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
         try {
             if (it.statusOptionId === null) {
                 const held = it.assignees.length > 0;
+                const columnName = held ? cfg.statusClaimed : cfg.statusUnclaimed;
                 await setStatus(octokit, ctx, it.itemId, held ? claimedId : unclaimedId);
                 placed++;
-                core.info(`#${it.issueNumber}: had no status; placed in ${held ? cfg.statusClaimed : cfg.statusUnclaimed}.`);
+                core.info(`#${it.issueNumber}: had no status; placed in ${columnName}.`);
+                await reportRepair(repoOctokit, cfg, it, `this card had no status on the **${cfg.projectTitle}** board, so I've put it in **${columnName}** (${held ? 'somebody is registered on it' : 'nobody is registered on it'}).`);
                 continue;
             }
             if (it.assignees.length > 0)
@@ -33131,12 +33148,35 @@ async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
             }
             filled++;
             core.info(`#${it.issueNumber}: active with no holder; assigned the author @${it.author}.`);
+            await reportRepair(repoOctokit, cfg, it, `this card was in an active column with nobody registered on it, so I've assigned @${it.author}, who opened it.`);
         }
         catch (err) {
             core.warning(`#${it.issueNumber}: reconciliation failed: ${err.message}`);
         }
     }
     core.info(`Holder reconciliation: ${placed} card(s) placed, ${filled} holder(s) restored.`);
+}
+/**
+ * Announce a repair on the issue it was made to, so the registrant sees why the bot touched their
+ * card, and cc the maintainers named in `notify-maintainers` so somebody responsible learns that a
+ * malformed card existed at all — these shapes come from board edits made by hand, which no webhook
+ * a repository workflow can subscribe to would report.
+ *
+ * Only successful repairs are announced, and each repair makes its own precondition false, so a
+ * card is announced once and never again. Failures are logged as warnings instead, since a repair
+ * that keeps failing would otherwise comment on every sweep. A failure to comment must never abort
+ * the reconciliation: the repair itself has already landed and matters more than its announcement.
+ */
+async function reportRepair(repoOctokit, cfg, it, what) {
+    const cc = cfg.notifyMaintainers.length
+        ? `\n\ncc ${cfg.notifyMaintainers.map((m) => `@${m}`).join(' ')} — this usually follows a board edit made by hand.`
+        : '';
+    try {
+        await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:wrench: ${what}${cc}`);
+    }
+    catch (err) {
+        core.warning(`#${it.issueNumber}: repaired, but could not comment: ${err.message}`);
+    }
 }
 async function processCandidate(octokit, repoOctokit, cfg, ctx, c, now, onExpire, onBackfill) {
     const owner = c.issueOwner;
@@ -33373,10 +33413,13 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
     if (missing.length) {
         first += ` I couldn't register ${missing.map((m) => `@${m}`).join(', ')} — GitHub only lets me assign collaborators, org members, or people who have commented on the issue. Anyone listed can comment \`claim\` here to add themselves.`;
     }
-    if (unreadable) {
-        // Handles must carry a leading @, so that ordinary prose in the field cannot be mistaken for
-        // an assignment. Say so rather than registering nobody in silence.
-        first += ` I couldn't read any GitHub handles in the "${cfg.claimParticipantsField}" field, which says ${JSON.stringify(unreadable)} — handles need a leading \`@\`, as in \`@alice\`. Edit the issue to correct them, and they can then comment \`claim\` to join.`;
+    if (unreadable.length) {
+        // A handle must carry a leading @, so that ordinary prose in a free-text field cannot be
+        // mistaken for an assignment. Name each token that was dropped, rather than leaving somebody
+        // unregistered with nothing to explain why.
+        const shown = unreadable.slice(0, 5).map((t) => `\`${t.replace(/`/g, '')}\``).join(', ');
+        const more = unreadable.length > 5 ? `, and ${unreadable.length - 5} more` : '';
+        first += ` I couldn't read ${shown}${more} in the "${cfg.claimParticipantsField}" field as GitHub handles — each one needs its leading \`@\`, as in \`@alice\`. Edit the issue to correct them, and they can then comment \`claim\` to join.`;
     }
     // When the form requires an absolute date, don't advertise a duration example the form would reject.
     const changeHint = cfg.claimExpiryRequireDate ? 'e.g. `claim 2026-09-01`' : 'e.g. `claim 2 weeks` or `claim 2026-09-01`';
@@ -33399,19 +33442,16 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
  */
 async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, body) {
     if (!cfg.claimParticipantsField)
-        return { added: [], missing: [], unreadable: '' };
+        return { added: [], missing: [], unreadable: [] };
     // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
     // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
     // is still named in the confirmation comment rather than dropped silently.
     const maxParticipants = 9;
-    const raw = readFormField(body, cfg.claimParticipantsField);
-    const all = parseParticipants(raw).filter((p) => p.toLowerCase() !== author.toLowerCase());
-    if (all.length === 0) {
-        // The field was filled in, yet nothing in it parsed as a handle — almost always a missing `@`,
-        // which the parser requires so that ordinary prose cannot be mistaken for an assignment. Report
-        // it rather than registering nobody in silence.
-        return { added: [], missing: [], unreadable: raw ? raw.slice(0, 120) : '' };
-    }
+    const scan = scanParticipants(readFormField(body, cfg.claimParticipantsField));
+    const unreadable = scan.unreadable;
+    const all = scan.logins.filter((p) => p.toLowerCase() !== author.toLowerCase());
+    if (all.length === 0)
+        return { added: [], missing: [], unreadable };
     const listed = all.slice(0, maxParticipants);
     const overflow = all.slice(maxParticipants);
     if (overflow.length)
@@ -33429,11 +33469,11 @@ async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, 
         const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()));
         const added = assignable.filter((p) => after.has(p.toLowerCase()));
         const dropped = assignable.filter((p) => !after.has(p.toLowerCase()));
-        return { added, missing: [...rejected, ...dropped, ...overflow], unreadable: '' };
+        return { added, missing: [...rejected, ...dropped, ...overflow], unreadable };
     }
     catch (err) {
         core.warning(`#${num}: could not register participants (${err.message}); continuing with the author alone.`);
-        return { added: [], missing: all, unreadable: '' };
+        return { added: [], missing: all, unreadable };
     }
 }
 async function runPullEvent(octokit, repoOctokit, cfg, ctx, action) {

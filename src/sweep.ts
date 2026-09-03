@@ -109,9 +109,12 @@ async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Con
     try {
       if (it.statusOptionId === null) {
         const held = it.assignees.length > 0
+        const columnName = held ? cfg.statusClaimed : cfg.statusUnclaimed
         await setStatus(octokit, ctx, it.itemId, held ? claimedId : unclaimedId)
         placed++
-        core.info(`#${it.issueNumber}: had no status; placed in ${held ? cfg.statusClaimed : cfg.statusUnclaimed}.`)
+        core.info(`#${it.issueNumber}: had no status; placed in ${columnName}.`)
+        await reportRepair(repoOctokit, cfg, it,
+          `this card had no status on the **${cfg.projectTitle}** board, so I've put it in **${columnName}** (${held ? 'somebody is registered on it' : 'nobody is registered on it'}).`)
         continue
       }
       if (it.assignees.length > 0) continue
@@ -127,11 +130,35 @@ async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Con
       }
       filled++
       core.info(`#${it.issueNumber}: active with no holder; assigned the author @${it.author}.`)
+      await reportRepair(repoOctokit, cfg, it,
+        `this card was in an active column with nobody registered on it, so I've assigned @${it.author}, who opened it.`)
     } catch (err) {
       core.warning(`#${it.issueNumber}: reconciliation failed: ${(err as Error).message}`)
     }
   }
   core.info(`Holder reconciliation: ${placed} card(s) placed, ${filled} holder(s) restored.`)
+}
+
+/**
+ * Announce a repair on the issue it was made to, so the registrant sees why the bot touched their
+ * card, and cc the maintainers named in `notify-maintainers` so somebody responsible learns that a
+ * malformed card existed at all — these shapes come from board edits made by hand, which no webhook
+ * a repository workflow can subscribe to would report.
+ *
+ * Only successful repairs are announced, and each repair makes its own precondition false, so a
+ * card is announced once and never again. Failures are logged as warnings instead, since a repair
+ * that keeps failing would otherwise comment on every sweep. A failure to comment must never abort
+ * the reconciliation: the repair itself has already landed and matters more than its announcement.
+ */
+async function reportRepair(repoOctokit: Octokit, cfg: Config, it: ClaimedItem, what: string): Promise<void> {
+  const cc = cfg.notifyMaintainers.length
+    ? `\n\ncc ${cfg.notifyMaintainers.map((m) => `@${m}`).join(' ')} — this usually follows a board edit made by hand.`
+    : ''
+  try {
+    await comment(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, `:wrench: ${what}${cc}`)
+  } catch (err) {
+    core.warning(`#${it.issueNumber}: repaired, but could not comment: ${(err as Error).message}`)
+  }
 }
 
 async function processCandidate(

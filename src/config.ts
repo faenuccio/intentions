@@ -30,6 +30,7 @@ export interface Config {
   claimParticipantsField: string
   participantClaim: boolean
   enforceHolder: boolean
+  notifyMaintainers: string[]
   statusCommands: boolean
 }
 
@@ -123,6 +124,10 @@ export function readConfig(): Config {
     claimParticipantsField: core.getInput('claim-participants-field') || '',
     participantClaim: boolInput('participant-claim', false),
     enforceHolder: boolInput('enforce-holder', false),
+    notifyMaintainers: (core.getInput('notify-maintainers') || '')
+      .split(',')
+      .map((s) => s.trim().replace(/^@/, ''))
+      .filter(Boolean),
     statusCommands: boolInput('status-commands', false),
   }
 }
