@@ -1,7 +1,8 @@
 import { expiryEnabled } from '../config.js'
 import { resolveExpiry, toStorage, formatExpiry } from '../ttl.js'
 import { getIssueItem, setStatus, setExpiry } from '../github/projects.js'
-import { getAssignees, getIssueBody, assign, comment } from '../github/issues.js'
+import { getAssignees, getIssueBody, getIssue, assign, comment } from '../github/issues.js'
+import { isEntitled } from '../entitlement.js'
 import { type Deps, optionId, requireOption, isTerminal } from './deps.js'
 import { writeNote } from './note.js'
 import { readFormField, parseParticipants } from '../issueForm.js'
@@ -14,6 +15,11 @@ import { readFormField, parseParticipants } from '../issueForm.js'
  * Unclaimed item with no assignees — except that a co-participant listed in the issue form may
  * join a held task (see tryJoinAsParticipant). Writes are ordered to fail closed: status +
  * expiry are set before assignment, so the sweep never sees a Claimed item with a missing expiry.
+ *
+ * With `participant-claim`, one branch is inserted ahead of those guardrails: the issue's author
+ * and the participants they declared may claim from any column (see registerEntitled). A registry
+ * board should never tell somebody their own intention is unavailable, and that branch is also the
+ * self-service repair for a card left in an odd state by a manual board edit.
  */
 export async function handleClaim(deps: Deps, expiryArg: string, note: string): Promise<void> {
   const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps
@@ -56,6 +62,15 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
     await comment(repoOctokit, owner, repo, issueNumber,
       `@${actor} claim renewed — now expires **${formatExpiry(res.expiry)}**.`)
     return
+  }
+
+  // ---- Entitled path: the author and declared participants are never turned away ----
+  if (cfg.participantClaim) {
+    const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
+    if (isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField)) {
+      await registerEntitled(deps, item, assignees, expiryArg, note, issue.state)
+      return
+    }
   }
 
   // ---- Fresh claim path: enforce guardrails --------------------------------
@@ -103,6 +118,71 @@ export async function handleClaim(deps: Deps, expiryArg: string, note: string): 
     lines.push(`That's the project default. To set your own, comment e.g. \`claim 2w\`, \`claim 5 hours\`, or \`claim 2026-08-01\` — and \`claim <when>\` again any time to extend.`)
   }
   await comment(repoOctokit, owner, repo, issueNumber, lines.join('\n\n'))
+}
+
+/**
+ * Register an entitled commenter — the issue's author, or somebody they declared as a participant
+ * — whatever column the card is in.
+ *
+ * The status is only ever moved forward into the claimed column when the card is not already in an
+ * active one, so a claim can never drag a card back out of In Progress or In Review. A closed issue
+ * is refused, since an intention that is simultaneously closed and actively registered is a
+ * contradiction the board cannot express. The expiry is resolved before anything is written, so a
+ * malformed date changes nothing; the assignment is then confirmed to have stuck before the board
+ * is touched, so a rejected assignment cannot leave a card registered to nobody.
+ */
+async function registerEntitled(
+  deps: Deps,
+  item: { itemId: string; statusOptionId: string | null },
+  assignees: string[],
+  expiryArg: string,
+  note: string,
+  issueState: 'open' | 'closed',
+): Promise<void> {
+  const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps
+
+  if (issueState === 'closed') {
+    await comment(repoOctokit, owner, repo, issueNumber,
+      `@${actor} this issue is closed, so I've left the board alone. Reopen it and comment \`claim\` again to register.`)
+    return
+  }
+
+  // Resolve the expiry first: a bad argument must change nothing at all.
+  let expiry: Date | null = null
+  if (expiryEnabled(cfg)) {
+    const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs)
+    if (!res.ok) {
+      await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}`)
+      return
+    }
+    expiry = res.expiry
+  }
+
+  await assign(repoOctokit, owner, repo, issueNumber, actor)
+  const after = await getAssignees(repoOctokit, owner, repo, issueNumber)
+  if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
+    await comment(repoOctokit, owner, repo, issueNumber,
+      `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.`)
+    return
+  }
+
+  const claimedId = requireOption(ctx, cfg.statusClaimed)
+  const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
+    .filter((id): id is string => id !== null))
+  const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId)
+
+  if (expiry) await setExpiry(octokit, ctx, item.itemId, toStorage(expiry))
+  if (!alreadyActive) await setStatus(octokit, ctx, item.itemId, claimedId)
+  // Only a first holder may clear a note left behind; a joiner must not wipe the group's note.
+  await writeNote(deps, item.itemId, note, assignees.length === 0)
+
+  const others = assignees.filter((a) => a.toLowerCase() !== actor.toLowerCase())
+  let line = others.length
+    ? `@${actor} you've joined this registration alongside ${others.map((a) => `@${a}`).join(', ')}.`
+    : `@${actor} you're registered as working on this.`
+  if (!alreadyActive) line += ` It's now **${cfg.statusClaimed}**.`
+  if (expiry) line += ` This registration expires **${formatExpiry(expiry)}**.`
+  await comment(repoOctokit, owner, repo, issueNumber, line)
 }
 
 /**

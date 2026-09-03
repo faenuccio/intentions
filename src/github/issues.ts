@@ -8,8 +8,24 @@ export async function getAssignees(octokit: Octokit, owner: string, repo: string
 }
 
 export async function getIssueBody(octokit: Octokit, owner: string, repo: string, issue_number: number): Promise<string> {
+  return (await getIssue(octokit, owner, repo, issue_number)).body
+}
+
+export interface IssueFacts {
+  body: string
+  /** login of whoever opened the issue ('' if the API omits it, e.g. a deleted account) */
+  author: string
+  state: 'open' | 'closed'
+}
+
+/** Body, author and open/closed state in a single request (entitlement needs all three). */
+export async function getIssue(octokit: Octokit, owner: string, repo: string, issue_number: number): Promise<IssueFacts> {
   const res = await octokit.rest.issues.get({ owner, repo, issue_number })
-  return res.data.body ?? ''
+  return {
+    body: res.data.body ?? '',
+    author: res.data.user?.login ?? '',
+    state: res.data.state === 'closed' ? 'closed' : 'open',
+  }
 }
 
 /**

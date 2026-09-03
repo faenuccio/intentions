@@ -31934,6 +31934,9 @@ function readConfig() {
         claimExpiryField: core.getInput('claim-expiry-field') || '',
         claimExpiryRequireDate: boolInput('claim-expiry-require-date', false),
         claimParticipantsField: core.getInput('claim-participants-field') || '',
+        participantClaim: boolInput('participant-claim', false),
+        enforceHolder: boolInput('enforce-holder', false),
+        statusCommands: boolInput('status-commands', false),
     };
 }
 /** Boolean input with a default when unset (core.getBooleanInput throws on empty). */
@@ -31964,6 +31967,15 @@ function parseCommand(body) {
     // Check disclaim before claim ("disclaim" contains "claim", but is anchored separately).
     if (normalized === 'disclaim')
         return { kind: 'disclaim' };
+    // Status commands: a holder moves their own card between columns without a pull request, for
+    // registries whose work lives in other repositories. Whole-comment matches only, so prose such
+    // as "this is in progress" cannot trigger them.
+    if (/^(?:progress|in progress|start|started)$/.test(normalized))
+        return { kind: 'status', target: 'in-progress' };
+    if (/^(?:review|in review|ready)$/.test(normalized))
+        return { kind: 'status', target: 'in-review' };
+    if (/^(?:done|complete|completed|finished)$/.test(normalized))
+        return { kind: 'status', target: 'completed' };
     const propose = normalized.match(/^propose\s*(?:pr\s*)?#(\d+)$/);
     if (propose)
         return { kind: 'propose', pr: Number(propose[1]) };
@@ -32143,8 +32155,14 @@ async function getIssueItem(octokit, owner, repo, issueNumber, ctx) {
     } while (cursor);
     return null;
 }
-/** Enumerate all board items whose status is one of `statusOptionIds` (for the sweep). */
-async function listItemsByStatus(octokit, ctx, statusOptionIds) {
+/**
+ * Enumerate board items whose status is one of `statusOptionIds` (for the sweep).
+ *
+ * With `includeStatusless`, items carrying no status at all are returned too. Those are invisible
+ * on a board grouped by status, so the holder reconciliation needs them explicitly; ordinary sweep
+ * callers leave the option off and never see them.
+ */
+async function listItemsByStatus(octokit, ctx, statusOptionIds, opts = {}) {
     const out = [];
     let cursor = null;
     do {
@@ -32155,7 +32173,7 @@ async function listItemsByStatus(octokit, ctx, statusOptionIds) {
               id
               content{
                 __typename
-                ... on Issue { number assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
+                ... on Issue { number author{ login } assignees(first:20){ nodes{ login } } repository{ name owner{ login } } }
               }
               ${ITEM_FIELD_VALUES}
             }
@@ -32171,7 +32189,11 @@ async function listItemsByStatus(octokit, ctx, statusOptionIds) {
                 throw new Error(`Item ${it.id} has more than 50 field values; refusing to act on a partial read.`);
             }
             const state = readItemState(it.id, it.fieldValues.nodes, ctx.statusFieldId, ctx.expiryFieldId);
-            if (!state.statusOptionId || !statusOptionIds.has(state.statusOptionId))
+            if (state.statusOptionId === null) {
+                if (!opts.includeStatusless)
+                    continue;
+            }
+            else if (!statusOptionIds.has(state.statusOptionId))
                 continue;
             out.push({
                 itemId: it.id,
@@ -32179,6 +32201,7 @@ async function listItemsByStatus(octokit, ctx, statusOptionIds) {
                 issueOwner: it.content.repository?.owner.login ?? '',
                 issueRepo: it.content.repository?.name ?? '',
                 assignees: (it.content.assignees?.nodes ?? []).map((a) => a.login),
+                author: it.content.author?.login ?? '',
                 statusOptionId: state.statusOptionId,
                 expiryText: state.expiryText,
             });
@@ -32237,8 +32260,16 @@ async function getAssignees(octokit, owner, repo, issue_number) {
     return (res.data.assignees ?? []).map((a) => a.login);
 }
 async function getIssueBody(octokit, owner, repo, issue_number) {
+    return (await getIssue(octokit, owner, repo, issue_number)).body;
+}
+/** Body, author and open/closed state in a single request (entitlement needs all three). */
+async function getIssue(octokit, owner, repo, issue_number) {
     const res = await octokit.rest.issues.get({ owner, repo, issue_number });
-    return res.data.body ?? '';
+    return {
+        body: res.data.body ?? '',
+        author: res.data.user?.login ?? '',
+        state: res.data.state === 'closed' ? 'closed' : 'open',
+    };
 }
 /**
  * The issues a PR closes via GitHub's parsed linkage (`Closes #N` / `Fixes #N` and the
@@ -32356,55 +32387,6 @@ async function unlinkPullFromIssue(octokit, owner, repo, pull_number, issueNumbe
     await octokit.rest.pulls.update({ owner, repo, pull_number, body: next });
 }
 
-;// CONCATENATED MODULE: ./src/commands/deps.ts
-function optionId(ctx, name) {
-    return ctx.statusOptionIdByName.get(name.toLowerCase()) ?? null;
-}
-function requireOption(ctx, name) {
-    const id = optionId(ctx, name);
-    if (!id)
-        throw new Error(`Project status field has no option named ${JSON.stringify(name)}.`);
-    return id;
-}
-function isTerminal(cfg, statusName) {
-    if (!statusName)
-        return false;
-    return cfg.terminalStatuses.some((s) => s.toLowerCase() === statusName.toLowerCase());
-}
-
-;// CONCATENATED MODULE: ./src/commands/note.ts
-
-
-/** Project v2 text fields are bounded; cap the scraped note so a long comment can't fail the write. */
-const MAX_NOTE_LENGTH = 1024;
-/**
- * Record the freeform note scraped from a claim/assign comment.
- *
- * With a non-empty note: writes it (truncated to a safe length) when the board has a note field,
- * else logs and ignores it (notes are an optional convenience). With an empty note: a no-op,
- * unless `clearIfEmpty` is set — fresh claims/assignments pass that so a new holder never inherits a
- * stale note left over from a failed clear or a manual board edit; renews leave the note as-is.
- *
- * Truncation iterates by code point (spread), so it can't split a surrogate pair and store
- * broken Unicode for notes ending in an emoji or other non-BMP character.
- */
-async function writeNote(deps, itemId, note, clearIfEmpty = false) {
-    const { octokit, ctx } = deps;
-    const trimmed = note.trim();
-    if (!trimmed) {
-        if (clearIfEmpty)
-            await clearNote(octokit, ctx, itemId);
-        return;
-    }
-    if (!ctx.noteFieldId) {
-        core.info(`A claim note was provided but the board has no "${deps.cfg.noteField}" Text field; ignoring it.`);
-        return;
-    }
-    const chars = [...trimmed];
-    const text = chars.length > MAX_NOTE_LENGTH ? `${chars.slice(0, MAX_NOTE_LENGTH - 1).join('')}…` : trimmed;
-    await setNote(octokit, ctx, itemId, text);
-}
-
 ;// CONCATENATED MODULE: ./src/issueForm.ts
 /**
  * Read a single field out of a GitHub issue-form body.
@@ -32459,7 +32441,80 @@ function parseParticipants(value) {
     return logins;
 }
 
+;// CONCATENATED MODULE: ./src/entitlement.ts
+
+/**
+ * Who may act on a registration irrespective of the column it sits in.
+ *
+ * A registry board is not a work queue: the person who registered an intention, and the people
+ * they named as working on it with them, are its natural custodians, and the bot should never tell
+ * them their own project is unavailable. Everyone else remains bound by the ordinary status rules,
+ * so a genuinely free card can still be picked up by a newcomer.
+ *
+ * Entitlement is read from the issue at the moment of the comment, never cached: an author may add
+ * a collaborator at any time by editing the body, and the change takes effect immediately.
+ */
+function isEntitled(actor, issueAuthor, issueBody, participantsField) {
+    const a = actor.toLowerCase();
+    if (issueAuthor && a === issueAuthor.toLowerCase())
+        return true;
+    if (!participantsField)
+        return false;
+    return parseParticipants(readFormField(issueBody, participantsField))
+        .some((p) => p.toLowerCase() === a);
+}
+
+;// CONCATENATED MODULE: ./src/commands/deps.ts
+function optionId(ctx, name) {
+    return ctx.statusOptionIdByName.get(name.toLowerCase()) ?? null;
+}
+function requireOption(ctx, name) {
+    const id = optionId(ctx, name);
+    if (!id)
+        throw new Error(`Project status field has no option named ${JSON.stringify(name)}.`);
+    return id;
+}
+function isTerminal(cfg, statusName) {
+    if (!statusName)
+        return false;
+    return cfg.terminalStatuses.some((s) => s.toLowerCase() === statusName.toLowerCase());
+}
+
+;// CONCATENATED MODULE: ./src/commands/note.ts
+
+
+/** Project v2 text fields are bounded; cap the scraped note so a long comment can't fail the write. */
+const MAX_NOTE_LENGTH = 1024;
+/**
+ * Record the freeform note scraped from a claim/assign comment.
+ *
+ * With a non-empty note: writes it (truncated to a safe length) when the board has a note field,
+ * else logs and ignores it (notes are an optional convenience). With an empty note: a no-op,
+ * unless `clearIfEmpty` is set — fresh claims/assignments pass that so a new holder never inherits a
+ * stale note left over from a failed clear or a manual board edit; renews leave the note as-is.
+ *
+ * Truncation iterates by code point (spread), so it can't split a surrogate pair and store
+ * broken Unicode for notes ending in an emoji or other non-BMP character.
+ */
+async function writeNote(deps, itemId, note, clearIfEmpty = false) {
+    const { octokit, ctx } = deps;
+    const trimmed = note.trim();
+    if (!trimmed) {
+        if (clearIfEmpty)
+            await clearNote(octokit, ctx, itemId);
+        return;
+    }
+    if (!ctx.noteFieldId) {
+        core.info(`A claim note was provided but the board has no "${deps.cfg.noteField}" Text field; ignoring it.`);
+        return;
+    }
+    const chars = [...trimmed];
+    const text = chars.length > MAX_NOTE_LENGTH ? `${chars.slice(0, MAX_NOTE_LENGTH - 1).join('')}…` : trimmed;
+    await setNote(octokit, ctx, itemId, text);
+}
+
 ;// CONCATENATED MODULE: ./src/commands/claim.ts
+
 
 
 
@@ -32475,6 +32530,11 @@ function parseParticipants(value) {
  * Unclaimed item with no assignees — except that a co-participant listed in the issue form may
  * join a held task (see tryJoinAsParticipant). Writes are ordered to fail closed: status +
  * expiry are set before assignment, so the sweep never sees a Claimed item with a missing expiry.
+ *
+ * With `participant-claim`, one branch is inserted ahead of those guardrails: the issue's author
+ * and the participants they declared may claim from any column (see registerEntitled). A registry
+ * board should never tell somebody their own intention is unavailable, and that branch is also the
+ * self-service repair for a card left in an odd state by a manual board edit.
  */
 async function handleClaim(deps, expiryArg, note) {
     const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
@@ -32511,6 +32571,14 @@ async function handleClaim(deps, expiryArg, note) {
         await writeNote(deps, item.itemId, note);
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} claim renewed — now expires **${formatExpiry(res.expiry)}**.`);
         return;
+    }
+    // ---- Entitled path: the author and declared participants are never turned away ----
+    if (cfg.participantClaim) {
+        const issue = await getIssue(repoOctokit, owner, repo, issueNumber);
+        if (isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField)) {
+            await registerEntitled(deps, item, assignees, expiryArg, note, issue.state);
+            return;
+        }
     }
     // ---- Fresh claim path: enforce guardrails --------------------------------
     if (isTerminal(cfg, statusName)) {
@@ -32552,6 +32620,59 @@ async function handleClaim(deps, expiryArg, note) {
         lines.push(`That's the project default. To set your own, comment e.g. \`claim 2w\`, \`claim 5 hours\`, or \`claim 2026-08-01\` — and \`claim <when>\` again any time to extend.`);
     }
     await comment(repoOctokit, owner, repo, issueNumber, lines.join('\n\n'));
+}
+/**
+ * Register an entitled commenter — the issue's author, or somebody they declared as a participant
+ * — whatever column the card is in.
+ *
+ * The status is only ever moved forward into the claimed column when the card is not already in an
+ * active one, so a claim can never drag a card back out of In Progress or In Review. A closed issue
+ * is refused, since an intention that is simultaneously closed and actively registered is a
+ * contradiction the board cannot express. The expiry is resolved before anything is written, so a
+ * malformed date changes nothing; the assignment is then confirmed to have stuck before the board
+ * is touched, so a rejected assignment cannot leave a card registered to nobody.
+ */
+async function registerEntitled(deps, item, assignees, expiryArg, note, issueState) {
+    const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
+    if (issueState === 'closed') {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue is closed, so I've left the board alone. Reopen it and comment \`claim\` again to register.`);
+        return;
+    }
+    // Resolve the expiry first: a bad argument must change nothing at all.
+    let expiry = null;
+    if (expiryEnabled(cfg)) {
+        const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs);
+        if (!res.ok) {
+            await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}`);
+            return;
+        }
+        expiry = res.expiry;
+    }
+    await issues_assign(repoOctokit, owner, repo, issueNumber, actor);
+    const after = await getAssignees(repoOctokit, owner, repo, issueNumber);
+    if (!after.some((a) => a.toLowerCase() === actor.toLowerCase())) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.`);
+        return;
+    }
+    const claimedId = requireOption(ctx, cfg.statusClaimed);
+    const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
+        .filter((id) => id !== null));
+    const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId);
+    if (expiry)
+        await setExpiry(octokit, ctx, item.itemId, toStorage(expiry));
+    if (!alreadyActive)
+        await setStatus(octokit, ctx, item.itemId, claimedId);
+    // Only a first holder may clear a note left behind; a joiner must not wipe the group's note.
+    await writeNote(deps, item.itemId, note, assignees.length === 0);
+    const others = assignees.filter((a) => a.toLowerCase() !== actor.toLowerCase());
+    let line = others.length
+        ? `@${actor} you've joined this registration alongside ${others.map((a) => `@${a}`).join(', ')}.`
+        : `@${actor} you're registered as working on this.`;
+    if (!alreadyActive)
+        line += ` It's now **${cfg.statusClaimed}**.`;
+    if (expiry)
+        line += ` This registration expires **${formatExpiry(expiry)}**.`;
+    await comment(repoOctokit, owner, repo, issueNumber, line);
 }
 /**
  * Join an active registration as a listed co-participant.
@@ -32842,6 +32963,57 @@ async function handleWithdraw(deps, pr) {
     await comment(repoOctokit, owner, repo, issueNumber, `@${actor} withdrew PR #${pr}; task is back to **${cfg.statusClaimed}** and still yours.`);
 }
 
+;// CONCATENATED MODULE: ./src/commands/status.ts
+
+
+
+
+/**
+ * Handle `progress` / `review` / `done`: a holder moves their own card between columns.
+ *
+ * The pull-request routes into In Progress and In Review (`propose`, and the automatic `Closes #N`
+ * linkage) only recognise pull requests targeting this same repository. A registry whose entries
+ * describe work carried out elsewhere therefore has no way to reach those columns at all, which
+ * leaves every registrant dependent on a maintainer moving cards by hand. These commands close
+ * that gap without involving a pull request.
+ *
+ * Authority is deliberately narrow: only somebody already registered on the intention may move it,
+ * plus (under `participant-claim`) the author and declared participants, who are entitled to act on
+ * their own intention even before anyone has been assigned to it.
+ */
+async function handleStatus(deps, target) {
+    const { octokit, repoOctokit, cfg, ctx, owner, repo, issueNumber, actor } = deps;
+    const wanted = target === 'in-progress' ? cfg.statusInProgress :
+        target === 'in-review' ? cfg.statusInReview :
+            cfg.statusCompleted;
+    const item = await getIssueItem(octokit, owner, repo, issueNumber, ctx);
+    if (!item) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so there's no card to move.`);
+        return;
+    }
+    const assignees = await getAssignees(repoOctokit, owner, repo, issueNumber);
+    let allowed = assignees.some((a) => a.toLowerCase() === actor.toLowerCase());
+    if (!allowed && cfg.participantClaim) {
+        const issue = await getIssue(repoOctokit, owner, repo, issueNumber);
+        allowed = isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField);
+    }
+    if (!allowed) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} only somebody registered on this intention can move it. Comment \`claim\` to register yourself first.`);
+        return;
+    }
+    const targetId = optionId(ctx, wanted);
+    if (!targetId) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this board has no **${wanted}** column, so there's nowhere to move the card.`);
+        return;
+    }
+    if (item.statusOptionId === targetId) {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this is already **${wanted}**.`);
+        return;
+    }
+    await setStatus(octokit, ctx, item.itemId, targetId);
+    await comment(repoOctokit, owner, repo, issueNumber, `@${actor} moved to **${wanted}**.`);
+}
+
 ;// CONCATENATED MODULE: ./src/sweep.ts
 
 
@@ -32866,6 +33038,10 @@ function sameSet(a, b) {
  * still due at the moment of mutation.
  */
 async function runSweep(octokit, repoOctokit, cfg, ctx) {
+    // Runs before the expiry pass, and outside its early return, so the board keeps its shape even
+    // on a project that has switched expiry off entirely.
+    if (cfg.enforceHolder)
+        await reconcileHolders(octokit, repoOctokit, cfg, ctx);
     if (!expiryEnabled(cfg)) {
         core.info('Expiry is disabled for this project (default-ttl: none); sweep is a no-op.');
         return;
@@ -32899,6 +33075,68 @@ async function runSweep(octokit, repoOctokit, cfg, ctx) {
         }
     }
     core.info(`Sweep complete: ${expired} expired, ${backfilled} backfilled.`);
+}
+/**
+ * Keep every card in a shape the rest of the bot can reason about: give each one a column, and
+ * make sure an active card has somebody holding it.
+ *
+ * Two malformed shapes arise in practice, both from board edits made by hand, which no webhook a
+ * repository workflow can subscribe to would report. A card with no status at all is invisible in a
+ * board grouped by status and is refused by `claim` as "not Unclaimed"; a card sitting in an active
+ * column with nobody assigned is refused as "held by someone", naming a holder who does not exist.
+ * Reconciling here repairs both within one sweep of them appearing.
+ *
+ * A statusless card is placed by what it already carries: holders mean it is registered, so it goes
+ * to the claimed column; no holders means it is free, so it goes to the unclaimed one. The author is
+ * used as the fallback holder only when the assignee list is empty, so any deliberate choice — the
+ * bot's or a maintainer's — is left exactly as it stands. Terminal columns are not touched, since a
+ * finished piece of work needs no holder.
+ */
+async function reconcileHolders(octokit, repoOctokit, cfg, ctx) {
+    const claimedId = ctx.statusOptionIdByName.get(cfg.statusClaimed.toLowerCase());
+    const unclaimedId = ctx.statusOptionIdByName.get(cfg.statusUnclaimed.toLowerCase());
+    if (!claimedId || !unclaimedId) {
+        core.warning('enforce-holder is on, but the claimed/unclaimed status options do not resolve; skipping reconciliation.');
+        return;
+    }
+    const active = new Set([claimedId]);
+    for (const name of [cfg.statusInProgress, cfg.statusInReview]) {
+        const id = ctx.statusOptionIdByName.get(name.toLowerCase());
+        if (id)
+            active.add(id);
+    }
+    const items = await listItemsByStatus(octokit, ctx, active, { includeStatusless: true });
+    let placed = 0;
+    let filled = 0;
+    for (const it of items) {
+        try {
+            if (it.statusOptionId === null) {
+                const held = it.assignees.length > 0;
+                await setStatus(octokit, ctx, it.itemId, held ? claimedId : unclaimedId);
+                placed++;
+                core.info(`#${it.issueNumber}: had no status; placed in ${held ? cfg.statusClaimed : cfg.statusUnclaimed}.`);
+                continue;
+            }
+            if (it.assignees.length > 0)
+                continue;
+            if (!it.author) {
+                core.warning(`#${it.issueNumber}: no holder and no readable author; leaving alone.`);
+                continue;
+            }
+            await issues_assign(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, it.author);
+            const after = await getAssignees(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber);
+            if (!after.some((a) => a.toLowerCase() === it.author.toLowerCase())) {
+                core.info(`#${it.issueNumber}: GitHub didn't accept the author @${it.author} as an assignee; leaving alone.`);
+                continue;
+            }
+            filled++;
+            core.info(`#${it.issueNumber}: active with no holder; assigned the author @${it.author}.`);
+        }
+        catch (err) {
+            core.warning(`#${it.issueNumber}: reconciliation failed: ${err.message}`);
+        }
+    }
+    core.info(`Holder reconciliation: ${placed} card(s) placed, ${filled} holder(s) restored.`);
 }
 async function processCandidate(octokit, repoOctokit, cfg, ctx, c, now, onExpire, onBackfill) {
     const owner = c.issueOwner;
@@ -33061,8 +33299,15 @@ async function runIssueEvent(octokit, repoOctokit, cfg, ctx, action) {
         const unclaimed = optionId(ctx, cfg.statusUnclaimed);
         // Only revert a Completed item; never disturb an active claim that was reopened.
         if (completed && unclaimed && item.statusOptionId === completed) {
-            await setStatus(octokit, ctx, item.itemId, unclaimed);
-            core.info(`#${num}: reopened -> ${cfg.statusUnclaimed}.`);
+            // Closing an issue does not unassign anybody, so a reopened item may still have its holders.
+            // Sending it to the unclaimed column whilst they remain produces a card nobody can claim: the
+            // holders are refused because it is not free, everybody else because somebody holds it. Return
+            // a still-held item to the claimed column instead, and only a genuinely empty one to unclaimed.
+            const claimed = optionId(ctx, cfg.statusClaimed);
+            const holders = await getAssignees(repoOctokit, owner, repo, num);
+            const target = holders.length > 0 && claimed ? claimed : unclaimed;
+            await setStatus(octokit, ctx, item.itemId, target);
+            core.info(`#${num}: reopened -> ${target === unclaimed ? cfg.statusUnclaimed : cfg.statusClaimed}.`);
         }
     }
 }
@@ -33093,7 +33338,7 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
         core.info(`#${num}: GitHub didn't accept @${author} as an assignee; left ${cfg.statusUnclaimed} for a manual claim.`);
         return;
     }
-    const { added, missing } = await registerParticipants(repoOctokit, cfg, owner, repo, num, author, body);
+    const { added, missing, unreadable } = await registerParticipants(repoOctokit, cfg, owner, repo, num, author, body);
     let expiry = null;
     let expiryNote = '';
     if (expiryEnabled(cfg)) {
@@ -33128,6 +33373,11 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
     if (missing.length) {
         first += ` I couldn't register ${missing.map((m) => `@${m}`).join(', ')} — GitHub only lets me assign collaborators, org members, or people who have commented on the issue. Anyone listed can comment \`claim\` here to add themselves.`;
     }
+    if (unreadable) {
+        // Handles must carry a leading @, so that ordinary prose in the field cannot be mistaken for
+        // an assignment. Say so rather than registering nobody in silence.
+        first += ` I couldn't read any GitHub handles in the "${cfg.claimParticipantsField}" field, which says ${JSON.stringify(unreadable)} — handles need a leading \`@\`, as in \`@alice\`. Edit the issue to correct them, and they can then comment \`claim\` to join.`;
+    }
     // When the form requires an absolute date, don't advertise a duration example the form would reject.
     const changeHint = cfg.claimExpiryRequireDate ? 'e.g. `claim 2026-09-01`' : 'e.g. `claim 2 weeks` or `claim 2026-09-01`';
     const second = expiryEnabled(cfg)
@@ -33149,15 +33399,19 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
  */
 async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, body) {
     if (!cfg.claimParticipantsField)
-        return { added: [], missing: [] };
+        return { added: [], missing: [], unreadable: '' };
     // GitHub caps an issue at ten assignees and the author holds one, so nine is every slot the form
     // can fill. Probing past that is wasted calls on a free-text field a paste can flood; the excess
     // is still named in the confirmation comment rather than dropped silently.
     const maxParticipants = 9;
-    const all = parseParticipants(readFormField(body, cfg.claimParticipantsField))
-        .filter((p) => p.toLowerCase() !== author.toLowerCase());
-    if (all.length === 0)
-        return { added: [], missing: [] };
+    const raw = readFormField(body, cfg.claimParticipantsField);
+    const all = parseParticipants(raw).filter((p) => p.toLowerCase() !== author.toLowerCase());
+    if (all.length === 0) {
+        // The field was filled in, yet nothing in it parsed as a handle — almost always a missing `@`,
+        // which the parser requires so that ordinary prose cannot be mistaken for an assignment. Report
+        // it rather than registering nobody in silence.
+        return { added: [], missing: [], unreadable: raw ? raw.slice(0, 120) : '' };
+    }
     const listed = all.slice(0, maxParticipants);
     const overflow = all.slice(maxParticipants);
     if (overflow.length)
@@ -33175,11 +33429,11 @@ async function registerParticipants(repoOctokit, cfg, owner, repo, num, author, 
         const after = new Set((await getAssignees(repoOctokit, owner, repo, num)).map((a) => a.toLowerCase()));
         const added = assignable.filter((p) => after.has(p.toLowerCase()));
         const dropped = assignable.filter((p) => !after.has(p.toLowerCase()));
-        return { added, missing: [...rejected, ...dropped, ...overflow] };
+        return { added, missing: [...rejected, ...dropped, ...overflow], unreadable: '' };
     }
     catch (err) {
         core.warning(`#${num}: could not register participants (${err.message}); continuing with the author alone.`);
-        return { added: [], missing: all };
+        return { added: [], missing: all, unreadable: '' };
     }
 }
 async function runPullEvent(octokit, repoOctokit, cfg, ctx, action) {
@@ -33306,6 +33560,7 @@ async function casSetStatus(octokit, ctx, owner, repo, num, seen, targetOptionId
 
 
 
+
 async function main() {
     const cfg = readConfig();
     const octokit = (0,github.getOctokit)(cfg.token);
@@ -33379,6 +33634,15 @@ async function main() {
             break;
         case 'withdraw':
             await handleWithdraw(deps, command.pr);
+            break;
+        case 'status':
+            // Off by default: a project that has not enabled them should not have ordinary words like
+            // "done" quietly moving its board.
+            if (!cfg.statusCommands) {
+                core.info(`Status commands are disabled (status-commands: false); ignoring "${command.target}".`);
+                break;
+            }
+            await handleStatus(deps, command.target);
             break;
     }
 }

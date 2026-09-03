@@ -12,7 +12,7 @@ import {
   clearExpiry,
   clearNote,
 } from './github/projects.js'
-import { getAssignees, unassign, comment } from './github/issues.js'
+import { getAssignees, assign, unassign, comment } from './github/issues.js'
 
 type Octokit = ReturnType<typeof getOctokit>
 
@@ -34,6 +34,10 @@ function sameSet(a: string[], b: string[]): boolean {
  * still due at the moment of mutation.
  */
 export async function runSweep(octokit: Octokit, repoOctokit: Octokit, cfg: Config, ctx: ProjectContext): Promise<void> {
+  // Runs before the expiry pass, and outside its early return, so the board keeps its shape even
+  // on a project that has switched expiry off entirely.
+  if (cfg.enforceHolder) await reconcileHolders(octokit, repoOctokit, cfg, ctx)
+
   if (!expiryEnabled(cfg)) {
     core.info('Expiry is disabled for this project (default-ttl: none); sweep is a no-op.')
     return
@@ -67,6 +71,67 @@ export async function runSweep(octokit: Octokit, repoOctokit: Octokit, cfg: Conf
     }
   }
   core.info(`Sweep complete: ${expired} expired, ${backfilled} backfilled.`)
+}
+
+/**
+ * Keep every card in a shape the rest of the bot can reason about: give each one a column, and
+ * make sure an active card has somebody holding it.
+ *
+ * Two malformed shapes arise in practice, both from board edits made by hand, which no webhook a
+ * repository workflow can subscribe to would report. A card with no status at all is invisible in a
+ * board grouped by status and is refused by `claim` as "not Unclaimed"; a card sitting in an active
+ * column with nobody assigned is refused as "held by someone", naming a holder who does not exist.
+ * Reconciling here repairs both within one sweep of them appearing.
+ *
+ * A statusless card is placed by what it already carries: holders mean it is registered, so it goes
+ * to the claimed column; no holders means it is free, so it goes to the unclaimed one. The author is
+ * used as the fallback holder only when the assignee list is empty, so any deliberate choice — the
+ * bot's or a maintainer's — is left exactly as it stands. Terminal columns are not touched, since a
+ * finished piece of work needs no holder.
+ */
+async function reconcileHolders(octokit: Octokit, repoOctokit: Octokit, cfg: Config, ctx: ProjectContext): Promise<void> {
+  const claimedId = ctx.statusOptionIdByName.get(cfg.statusClaimed.toLowerCase())
+  const unclaimedId = ctx.statusOptionIdByName.get(cfg.statusUnclaimed.toLowerCase())
+  if (!claimedId || !unclaimedId) {
+    core.warning('enforce-holder is on, but the claimed/unclaimed status options do not resolve; skipping reconciliation.')
+    return
+  }
+  const active = new Set<string>([claimedId])
+  for (const name of [cfg.statusInProgress, cfg.statusInReview]) {
+    const id = ctx.statusOptionIdByName.get(name.toLowerCase())
+    if (id) active.add(id)
+  }
+
+  const items = await listItemsByStatus(octokit, ctx, active, { includeStatusless: true })
+  let placed = 0
+  let filled = 0
+  for (const it of items) {
+    try {
+      if (it.statusOptionId === null) {
+        const held = it.assignees.length > 0
+        await setStatus(octokit, ctx, it.itemId, held ? claimedId : unclaimedId)
+        placed++
+        core.info(`#${it.issueNumber}: had no status; placed in ${held ? cfg.statusClaimed : cfg.statusUnclaimed}.`)
+        continue
+      }
+      if (it.assignees.length > 0) continue
+      if (!it.author) {
+        core.warning(`#${it.issueNumber}: no holder and no readable author; leaving alone.`)
+        continue
+      }
+      await assign(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber, it.author)
+      const after = await getAssignees(repoOctokit, it.issueOwner, it.issueRepo, it.issueNumber)
+      if (!after.some((a) => a.toLowerCase() === it.author.toLowerCase())) {
+        core.info(`#${it.issueNumber}: GitHub didn't accept the author @${it.author} as an assignee; leaving alone.`)
+        continue
+      }
+      filled++
+      core.info(`#${it.issueNumber}: active with no holder; assigned the author @${it.author}.`)
+    } catch (err) {
+      core.warning(`#${it.issueNumber}: reconciliation failed: ${(err as Error).message}`)
+    }
+  }
+  core.info(`Holder reconciliation: ${placed} card(s) placed, ${filled} holder(s) restored.`)
 }
 
 async function processCandidate(
