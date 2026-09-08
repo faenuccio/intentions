@@ -32,10 +32,16 @@ export async function handleStatus(deps: Deps, target: StatusTarget): Promise<vo
     return
   }
 
+  const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
+  if (issue.state === 'closed' && target !== 'completed') {
+    await comment(repoOctokit, owner, repo, issueNumber,
+      `@${actor} this issue is closed, so I've left the board alone. Reopen it before moving it back to an active column.`)
+    return
+  }
+
   const assignees = await getAssignees(repoOctokit, owner, repo, issueNumber)
   let allowed = assignees.some((a) => a.toLowerCase() === actor.toLowerCase())
   if (!allowed && cfg.participantClaim) {
-    const issue = await getIssue(repoOctokit, owner, repo, issueNumber)
     allowed = isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField)
   }
   if (!allowed) {
