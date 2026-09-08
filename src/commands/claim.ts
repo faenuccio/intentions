@@ -177,9 +177,15 @@ async function registerEntitled(
     return
   }
 
-  // Resolve the expiry first: a bad argument must change nothing at all.
+  const claimedId = requireOption(ctx, cfg.statusClaimed)
+  const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
+    .filter((id): id is string => id !== null))
+  const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId)
+  const joiningExisting = alreadyActive && assignees.length > 0
+
+  // A bare claim by somebody joining an existing registration preserves its shared expiry.
   let expiry: Date | null = null
-  if (expiryEnabled(cfg)) {
+  if (expiryEnabled(cfg) && (!joiningExisting || expiryArg.trim().length > 0)) {
     const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs)
     if (!res.ok) {
       await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}${cc}`)
@@ -195,11 +201,6 @@ async function registerEntitled(
       `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${cc}`)
     return
   }
-
-  const claimedId = requireOption(ctx, cfg.statusClaimed)
-  const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
-    .filter((id): id is string => id !== null))
-  const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId)
 
   if (expiry) await setExpiry(octokit, ctx, item.itemId, toStorage(expiry))
   if (!alreadyActive) await setStatus(octokit, ctx, item.itemId, claimedId)
