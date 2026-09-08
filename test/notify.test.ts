@@ -11,21 +11,21 @@ test('no cc line when nobody is configured and nobody else is named', () => {
 })
 
 test('the configured maintainers are mentioned', () => {
-  assert.equal(maintainerCc(cfg(['faenuccio', 'kim-em'])), '\n\ncc @faenuccio @kim-em')
+  assert.equal(maintainerCc(cfg(['alice', 'bob'])), '\n\ncc @alice @bob')
 })
 
 test('an extra mention comes first, and the list still applies', () => {
-  assert.equal(maintainerCc(cfg(['kim-em']), ['lua-vr']), '\n\ncc @lua-vr @kim-em')
+  assert.equal(maintainerCc(cfg(['alice']), ['carol']), '\n\ncc @carol @alice')
 })
 
 test('a name appearing twice is mentioned once, case-insensitively', () => {
-  assert.equal(maintainerCc(cfg(['Kim-Em']), ['kim-em']), '\n\ncc @kim-em')
+  assert.equal(maintainerCc(cfg(['Alice']), ['alice']), '\n\ncc @alice')
 })
 
 test('a leading @ in configuration is tolerated, and blanks are dropped', () => {
-  assert.equal(maintainerCc(cfg(['@kim-em', '']), ['']), '\n\ncc @kim-em')
+  assert.equal(maintainerCc(cfg(['@alice', '']), ['']), '\n\ncc @alice')
 })
 
 test('an extra mention alone produces a cc line even with nobody configured', () => {
-  assert.equal(maintainerCc(cfg([]), ['lua-vr']), '\n\ncc @lua-vr')
+  assert.equal(maintainerCc(cfg([]), ['carol']), '\n\ncc @carol')
 })
