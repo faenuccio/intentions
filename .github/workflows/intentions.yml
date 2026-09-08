@@ -199,6 +199,7 @@ jobs:
           claim-expiry-field: ${{ inputs.claim-expiry-field }}
           claim-expiry-require-date: ${{ inputs.claim-expiry-require-date }}
           claim-participants-field: ${{ inputs.claim-participants-field }}
+          notify-maintainers: ${{ inputs.notify-maintainers }}
           expiry-field: ${{ inputs.expiry-field }}
           default-ttl: ${{ inputs.default-ttl }}
           max-ttl: ${{ inputs.max-ttl }}

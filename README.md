@@ -315,7 +315,7 @@ All inputs (set on the reusable workflow):
 | `participant-claim` | `false` | let the issue author and listed participants `claim` from any column, not only a free one. See [Registry mode](#registry-mode-entitlement-status-commands-and-a-well-formed-board) |
 | `status-commands` | `false` | enable the `progress` / `review` / `done` comment commands for holders |
 | `enforce-holder` | `false` | have the sweep give every card a column and assign the issue author to any active card with no holder |
-| `notify-maintainers` | `` | comma-separated logins to cc, alongside the issue's author, whenever a `claim` is declined and on every board repair or participants warning |
+| `notify-maintainers` | `` | comma-separated logins to cc, alongside the issue's author, whenever a `claim` is declined, on every board repair or participants warning, and on a registration whose participants or expiry could not be used in full |
 | `terminal-statuses` | `In Review,Completed` | states where a `claim` comment is refused |
 | `expiry-field` | `Claim Expires` | Text field holding the ISO 8601 UTC expiry |
 | `note-field` | `Claim Note` | optional Text field holding the freeform claim note; ignored if absent |

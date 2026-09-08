@@ -32714,9 +32714,14 @@ async function registerEntitled(deps, item, assignees, expiryArg, note, issueSta
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue is closed, so I've left the board alone. Reopen it and comment \`claim\` again to register.${cc}`);
         return;
     }
-    // Resolve the expiry first: a bad argument must change nothing at all.
+    const claimedId = requireOption(ctx, cfg.statusClaimed);
+    const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
+        .filter((id) => id !== null));
+    const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId);
+    const joiningExisting = alreadyActive && assignees.length > 0;
+    // A bare claim by somebody joining an existing registration preserves its shared expiry.
     let expiry = null;
-    if (expiryEnabled(cfg)) {
+    if (expiryEnabled(cfg) && (!joiningExisting || expiryArg.trim().length > 0)) {
         const res = resolveExpiry(expiryArg, new Date(), cfg.defaultTtl, cfg.maxTtlMs);
         if (!res.ok) {
             await comment(repoOctokit, owner, repo, issueNumber, `@${actor} ${res.reason}${cc}`);
@@ -32730,10 +32735,6 @@ async function registerEntitled(deps, item, assignees, expiryArg, note, issueSta
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} GitHub didn't accept the assignment, so I couldn't register you on this intention.${cc}`);
         return;
     }
-    const claimedId = requireOption(ctx, cfg.statusClaimed);
-    const active = new Set([claimedId, optionId(ctx, cfg.statusInProgress), optionId(ctx, cfg.statusInReview)]
-        .filter((id) => id !== null));
-    const alreadyActive = item.statusOptionId !== null && active.has(item.statusOptionId);
     if (expiry)
         await setExpiry(octokit, ctx, item.itemId, toStorage(expiry));
     if (!alreadyActive)
@@ -33066,10 +33067,14 @@ async function handleStatus(deps, target) {
         await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue isn't on the **${cfg.projectTitle}** board, so there's no card to move.`);
         return;
     }
+    const issue = await getIssue(repoOctokit, owner, repo, issueNumber);
+    if (issue.state === 'closed' && target !== 'completed') {
+        await comment(repoOctokit, owner, repo, issueNumber, `@${actor} this issue is closed, so I've left the board alone. Reopen it before moving it back to an active column.`);
+        return;
+    }
     const assignees = await getAssignees(repoOctokit, owner, repo, issueNumber);
     let allowed = assignees.some((a) => a.toLowerCase() === actor.toLowerCase());
     if (!allowed && cfg.participantClaim) {
-        const issue = await getIssue(repoOctokit, owner, repo, issueNumber);
         allowed = isEntitled(actor, issue.author, issue.body, cfg.claimParticipantsField);
     }
     if (!allowed) {
@@ -33528,8 +33533,17 @@ async function autoClaimOnOpen(octokit, repoOctokit, cfg, ctx, owner, repo, num,
     const second = expiryEnabled(cfg)
         ? `Comment \`claim <when>\` to change the expiry (${changeHint}), \`claim\` again to renew, or \`disclaim\` to release it.`
         : 'Comment `disclaim` to release it once you\'re done.';
-    await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}`);
-    core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}.`);
+    // Registration is the one moment a registrant is told that something went partly wrong — a
+    // participant who could not be assigned, a name that could not be read, an expiry that could not
+    // be used — and until now that was said to them alone. The registrant may not grasp the
+    // consequence: a credible date quietly replaced by the project default expires their work far
+    // earlier than they asked for. So cc whoever the project has named, but only when there is
+    // something to report, since a clean registration should notify nobody.
+    const shortfall = Boolean(expiryNote) || missing.length > 0 || unreadable.length > 0;
+    // The message already opens by @-mentioning the author, so the cc adds only the maintainers.
+    const cc = shortfall ? maintainerCc(cfg) : '';
+    await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}${cc}`);
+    core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}${shortfall ? ' (with a shortfall reported)' : ''}.`);
 }
 /**
  * Register the co-participants a registrant listed in the issue form (`claim-participants-field`)

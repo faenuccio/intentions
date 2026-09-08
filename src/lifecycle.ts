@@ -10,7 +10,7 @@ import {
   setExpiry,
 } from './github/projects.js'
 import { getAssignees, assign, assignMany, canBeAssigned, comment, getClosingIssueNumbers, getOpenClosingPullNumbers } from './github/issues.js'
-import { optionId } from './commands/deps.js'
+import { optionId, maintainerCc } from './commands/deps.js'
 import { readFormField, scanParticipants } from './issueForm.js'
 
 type Octokit = ReturnType<typeof getOctokit>
@@ -199,8 +199,17 @@ async function autoClaimOnOpen(
   const second = expiryEnabled(cfg)
     ? `Comment \`claim <when>\` to change the expiry (${changeHint}), \`claim\` again to renew, or \`disclaim\` to release it.`
     : 'Comment `disclaim` to release it once you\'re done.'
-  await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}`)
-  core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}.`)
+  // Registration is the one moment a registrant is told that something went partly wrong — a
+  // participant who could not be assigned, a name that could not be read, an expiry that could not
+  // be used — and until now that was said to them alone. The registrant may not grasp the
+  // consequence: a credible date quietly replaced by the project default expires their work far
+  // earlier than they asked for. So cc whoever the project has named, but only when there is
+  // something to report, since a clean registration should notify nobody.
+  const shortfall = Boolean(expiryNote) || missing.length > 0 || unreadable.length > 0
+  // The message already opens by @-mentioning the author, so the cc adds only the maintainers.
+  const cc = shortfall ? maintainerCc(cfg) : ''
+  await comment(repoOctokit, owner, repo, num, `${first}\n\n${second}${cc}`)
+  core.info(`#${num}: auto-claimed for @${author}${added.length ? ` with participants ${added.join(', ')}` : ''}${shortfall ? ' (with a shortfall reported)' : ''}.`)
 }
 
 /**
