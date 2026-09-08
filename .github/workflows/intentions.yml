@@ -155,6 +155,7 @@ jobs:
           claim-participants-field: ${{ inputs.claim-participants-field }}
           participant-claim: ${{ inputs.participant-claim }}
           status-commands: ${{ inputs.status-commands }}
+          notify-maintainers: ${{ inputs.notify-maintainers }}
           expiry-field: ${{ inputs.expiry-field }}
           default-ttl: ${{ inputs.default-ttl }}
           max-ttl: ${{ inputs.max-ttl }}
