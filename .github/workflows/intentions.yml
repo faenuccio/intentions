@@ -231,6 +231,7 @@ jobs:
           status-claimed: ${{ inputs.status-claimed }}
           status-in-progress: ${{ inputs.status-in-progress }}
           status-in-review: ${{ inputs.status-in-review }}
+          claim-participants-field: ${{ inputs.claim-participants-field }}
           enforce-holder: ${{ inputs.enforce-holder }}
           notify-maintainers: ${{ inputs.notify-maintainers }}
           expiry-field: ${{ inputs.expiry-field }}
